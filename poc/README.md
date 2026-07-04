@@ -40,7 +40,8 @@ hello-macos   1/1     Running   0          4s
 - `demo/pod.yaml` — example pod.
 - `_artifacts/` (gitignored) — libkrun.dylib + header, guest kernel, base
   Alpine rootfs, envtest binaries, kubeconfig, per-pod state
-  (`pods/<uid>/{rootfs,container.log}`).
+  (`pods/<uid>/{rootfs,container.log,vmm.log}` — container.log is workload
+  stdout/stderr only; VMM and guest-kernel diagnostics go to vmm.log).
 
 ## Building / running
 

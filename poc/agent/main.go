@@ -369,6 +369,7 @@ func (a *agent) startPod(ctx context.Context, pod *corev1.Pod) error {
 		"--rootfs", rootfs,
 		"--cpus", fmt.Sprintf("%d", cpus),
 		"--mem", fmt.Sprintf("%d", memMB),
+		"--log", filepath.Join(dir, "vmm.log"),
 		"--", "/bin/sh", "/entry.sh")
 	cmd.Stdout = logf
 	cmd.Stderr = logf

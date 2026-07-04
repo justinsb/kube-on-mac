@@ -16,6 +16,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <libkrun.h>
 #include <stdio.h>
@@ -28,7 +29,7 @@ static void usage(const char *name)
 {
     fprintf(stderr,
             "Usage: %s --kernel VMLINUX --rootfs DIR [--cpus N] [--mem MB] "
-            "[--dax-mb MB] -- COMMAND [ARGS...]\n",
+            "[--dax-mb MB] [--log FILE] -- COMMAND [ARGS...]\n",
             name);
 }
 
@@ -46,6 +47,7 @@ int main(int argc, char *const argv[])
 {
     const char *kernel_path = NULL;
     const char *rootfs = NULL;
+    const char *log_path = NULL;
     long cpus = 1;
     long mem_mib = 256;
     long dax_mib = 0;
@@ -56,18 +58,20 @@ int main(int argc, char *const argv[])
         { "cpus", required_argument, NULL, 'c' },
         { "mem", required_argument, NULL, 'm' },
         { "dax-mb", required_argument, NULL, 'd' },
+        { "log", required_argument, NULL, 'l' },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "+k:r:c:m:d:h", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "+k:r:c:m:d:l:h", opts, NULL)) != -1) {
         switch (c) {
         case 'k': kernel_path = optarg; break;
         case 'r': rootfs = optarg; break;
         case 'c': cpus = atol(optarg); break;
         case 'm': mem_mib = atol(optarg); break;
         case 'd': dax_mib = atol(optarg); break;
+        case 'l': log_path = optarg; break;
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 1;
         }
@@ -86,8 +90,19 @@ int main(int argc, char *const argv[])
         NULL
     };
 
-    if (check(krun_init_log(KRUN_LOG_TARGET_DEFAULT, KRUN_LOG_LEVEL_WARN,
-                            KRUN_LOG_STYLE_AUTO, 0),
+    /* Keep VMM/guest-kernel diagnostics out of the workload's output
+     * streams: with --log they go to their own file; stdout/stderr carry
+     * only what the workload writes over the virtio console. */
+    int log_fd = KRUN_LOG_TARGET_DEFAULT;
+    if (log_path != NULL) {
+        log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (log_fd < 0) {
+            perror(log_path);
+            return 1;
+        }
+    }
+    if (check(krun_init_log(log_fd, KRUN_LOG_LEVEL_WARN, KRUN_LOG_STYLE_AUTO,
+                            0),
               "krun_init_log"))
         return 1;
 
