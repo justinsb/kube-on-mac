@@ -85,8 +85,11 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
 - **No pod networking**: no IPs, no services. TSI was deliberately disabled
   (it needs libkrunfw's patched kernel); the real design is routed IPv6 via
   virtio-net + guest-side service LB.
-- **No kubelet server**: `kubectl logs/exec/port-forward` don't work; logs
-  land in `_artifacts/pods/<uid>/container.log`.
+- **Partial kubelet server**: `kubectl logs` works (including `-f` and
+  `--tail`) via the agent's HTTPS `/containerLogs` endpoint on :10250, but
+  it has no authn/authz (the real agent must do delegated TokenReview/
+  SubjectAccessReview) and `kubectl exec`/`port-forward`/`attach` are not
+  implemented yet.
 - **No probes, single container per pod, no volumes**, restartPolicy only
   honored as never-restart, control plane is envtest (no controller-manager,
   agent includes a 20-line bind-to-node "scheduler").

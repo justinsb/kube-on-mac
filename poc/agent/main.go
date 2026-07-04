@@ -44,12 +44,13 @@ type podVM struct {
 }
 
 type agent struct {
-	client     *kubernetes.Clientset
-	nodeName   string
-	harness    string
-	kernel     string
-	rootfsBase string
-	workDir    string
+	client      *kubernetes.Clientset
+	nodeName    string
+	harness     string
+	kernel      string
+	rootfsBase  string
+	workDir     string
+	kubeletPort int
 
 	mu  sync.Mutex
 	vms map[types.UID]*podVM
@@ -64,6 +65,7 @@ func main() {
 		workDir       = flag.String("work-dir", "../_artifacts/pods", "per-pod state dir")
 		assetsDir     = flag.String("assets", "", "envtest binary assets dir (kube-apiserver, etcd)")
 		kubeconfigOut = flag.String("kubeconfig-out", "../_artifacts/kubeconfig", "where to write admin kubeconfig")
+		kubeletPort   = flag.Int("kubelet-port", 10250, "port for the kubelet server (kubectl logs)")
 	)
 	flag.Parse()
 
@@ -82,7 +84,11 @@ func main() {
 	// No controller-manager runs here, so the ServiceAccount admission
 	// plugin would reject pods (no auto-created default SA). Disable it.
 	env.ControlPlane.GetAPIServer().Configure().
-		Append("disable-admission-plugins", "ServiceAccount")
+		Append("disable-admission-plugins", "ServiceAccount").
+		// The apiserver prefers the node's Hostname address for kubelet
+		// connections (logs/exec); "macos-poc" doesn't resolve, so use the
+		// InternalIP we register (127.0.0.1).
+		Append("kubelet-preferred-address-types", "InternalIP")
 
 	log.Printf("starting kube-apiserver + etcd (envtest)...")
 	cfg, err := env.Start()
@@ -106,13 +112,14 @@ func main() {
 	log.Printf("try: KUBECONFIG=%s kubectl get nodes", *kubeconfigOut)
 
 	a := &agent{
-		client:     kubernetes.NewForConfigOrDie(cfg),
-		nodeName:   *nodeName,
-		harness:    *harness,
-		kernel:     *kernel,
-		rootfsBase: *rootfsBase,
-		workDir:    *workDir,
-		vms:        map[types.UID]*podVM{},
+		client:      kubernetes.NewForConfigOrDie(cfg),
+		nodeName:    *nodeName,
+		harness:     *harness,
+		kernel:      *kernel,
+		rootfsBase:  *rootfsBase,
+		workDir:     *workDir,
+		kubeletPort: *kubeletPort,
+		vms:         map[types.UID]*podVM{},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -120,6 +127,10 @@ func main() {
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sigc; log.Printf("shutting down"); cancel() }()
+
+	if err := a.startKubeletServer(ctx, *kubeletPort); err != nil {
+		log.Fatalf("starting kubelet server: %v", err)
+	}
 
 	if err := a.registerNode(ctx); err != nil {
 		log.Fatalf("registering node: %v", err)
@@ -189,6 +200,9 @@ func (a *agent) nodeStatus() corev1.NodeStatus {
 		Addresses: []corev1.NodeAddress{
 			{Type: corev1.NodeInternalIP, Address: "127.0.0.1"},
 			{Type: corev1.NodeHostName, Address: a.nodeName},
+		},
+		DaemonEndpoints: corev1.NodeDaemonEndpoints{
+			KubeletEndpoint: corev1.DaemonEndpoint{Port: int32(a.kubeletPort)},
 		},
 		NodeInfo: corev1.NodeSystemInfo{
 			OperatingSystem:         "linux",
