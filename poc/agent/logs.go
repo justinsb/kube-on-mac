@@ -39,6 +39,8 @@ func (a *agent) startKubeletServer(ctx context.Context, port int) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/containerLogs/", a.handleContainerLogs)
+	mux.HandleFunc("/exec/", a.handleExec)
+	mux.HandleFunc("/attach/", a.handleAttach)
 
 	srv := &http.Server{
 		Handler:   mux,

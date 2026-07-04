@@ -37,6 +37,9 @@ hello-macos   1/1     Running   0          4s
   (envtest binaries), writes an admin kubeconfig, registers the Node,
   heartbeats Ready, binds unassigned pods (stand-in for kube-scheduler), and
   reconciles bound pods into `podvm` processes. One pod = one microVM.
+- `execd/` — the in-guest supervisor/exec daemon (Go, built static for
+  linux/arm64 into `_artifacts/execd`; the agent clones it into each pod
+  rootfs and `/entry.sh` execs it).
 - `demo/pod.yaml` — example pod.
 - `_artifacts/` (gitignored) — libkrun.dylib + header, guest kernel, base
   Alpine rootfs, envtest binaries, kubeconfig, per-pod state
@@ -81,16 +84,26 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
 
 ## Honest accounting of what's faked
 
-- **No image pull**: `image:` is recorded but every pod runs the shared
-  Alpine rootfs (APFS `cp -Rc` clone per pod).
+- **Image pull is real but flat**: images are pulled for linux/arm64 (via
+  go-containerregistry), flattened to a rootfs dir, and cached under
+  `_artifacts/images/`; pods get APFS clones. No layer store, no
+  imagePullSecrets, anonymous registry auth only. Pods with no command use
+  the image's Entrypoint/Cmd; image env vars/WorkingDir are not yet honored.
 - **No pod networking**: no IPs, no services. TSI was deliberately disabled
   (it needs libkrunfw's patched kernel); the real design is routed IPv6 via
   virtio-net + guest-side service LB.
-- **Partial kubelet server**: `kubectl logs` works (including `-f` and
-  `--tail`) via the agent's HTTPS `/containerLogs` endpoint on :10250, but
-  it has no authn/authz (the real agent must do delegated TokenReview/
-  SubjectAccessReview) and `kubectl exec`/`port-forward`/`attach` are not
-  implemented yet.
+- **Partial kubelet server**: `kubectl logs` (with `-f`, `--tail`),
+  `kubectl exec` (including `-it` with pty + resize + exit codes), and
+  `kubectl attach` (so `kubectl run -it --image=debian:latest -- bash`
+  gives an interactive root shell in a microVM) all work, served on :10250
+  using kubelet's own streaming library. Still missing: authn/authz on the
+  endpoint (delegated TokenReview/SubjectAccessReview), `port-forward`,
+  and multi-attach (one attach session at a time).
+- **In-guest supervision** is `execd` (poc/execd): a static Go daemon that
+  libkrun's init execs; it runs the workload (on a pty when the pod sets
+  `tty: true`), mirrors output to the console log, and serves exec/attach
+  over vsock (guest port 1024 ↔ host unix socket in /tmp — sun_path is
+  ~104 bytes on macOS, so the deep per-pod dir can't hold it).
 - **No probes, single container per pod, no volumes**, restartPolicy only
   honored as never-restart, control plane is envtest (no controller-manager,
   agent includes a 20-line bind-to-node "scheduler").

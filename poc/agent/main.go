@@ -13,6 +13,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -20,7 +21,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -50,6 +50,8 @@ type agent struct {
 	kernel      string
 	rootfsBase  string
 	workDir     string
+	imagesDir   string
+	execdPath   string
 	kubeletPort int
 
 	mu  sync.Mutex
@@ -63,13 +65,15 @@ func main() {
 		kernel        = flag.String("kernel", "../_artifacts/vmlinux-arm64", "guest kernel")
 		rootfsBase    = flag.String("rootfs-base", "../_artifacts/rootfs-alpine", "base rootfs dir")
 		workDir       = flag.String("work-dir", "../_artifacts/pods", "per-pod state dir")
+		imagesDir     = flag.String("images-dir", "../_artifacts/images", "pulled-image rootfs cache")
+		execdPath     = flag.String("execd", "../_artifacts/execd", "path to the guest execd binary (linux/arm64)")
 		assetsDir     = flag.String("assets", "", "envtest binary assets dir (kube-apiserver, etcd)")
 		kubeconfigOut = flag.String("kubeconfig-out", "../_artifacts/kubeconfig", "where to write admin kubeconfig")
 		kubeletPort   = flag.Int("kubelet-port", 10250, "port for the kubelet server (kubectl logs)")
 	)
 	flag.Parse()
 
-	for _, p := range []*string{harness, kernel, rootfsBase, workDir, kubeconfigOut} {
+	for _, p := range []*string{harness, kernel, rootfsBase, workDir, kubeconfigOut, imagesDir, execdPath} {
 		abs, err := filepath.Abs(*p)
 		if err != nil {
 			log.Fatalf("abs %q: %v", *p, err)
@@ -118,8 +122,13 @@ func main() {
 		kernel:      *kernel,
 		rootfsBase:  *rootfsBase,
 		workDir:     *workDir,
+		imagesDir:   *imagesDir,
+		execdPath:   *execdPath,
 		kubeletPort: *kubeletPort,
 		vms:         map[types.UID]*podVM{},
+	}
+	if err := os.MkdirAll(a.imagesDir, 0o755); err != nil {
+		log.Fatalf("creating images dir: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -144,7 +153,7 @@ func main() {
 	// Give VMs a moment to die with the agent.
 	a.mu.Lock()
 	for _, vm := range a.vms {
-		if vm.cmd.Process != nil {
+		if vm.cmd != nil && vm.cmd.Process != nil {
 			vm.cmd.Process.Kill()
 		}
 	}
@@ -290,7 +299,7 @@ func (a *agent) reconcilePod(ctx context.Context, pod *corev1.Pod) {
 	a.mu.Unlock()
 
 	if pod.DeletionTimestamp != nil {
-		if running && vm.cmd.Process != nil {
+		if running && vm.cmd != nil && vm.cmd.Process != nil {
 			log.Printf("pod %s/%s deleted; killing VM", pod.Namespace, pod.Name)
 			vm.cmd.Process.Signal(syscall.SIGTERM)
 		}
@@ -307,17 +316,35 @@ func (a *agent) reconcilePod(ctx context.Context, pod *corev1.Pod) {
 		return
 	}
 
-	if err := a.startPod(ctx, pod); err != nil {
-		log.Printf("starting pod %s/%s: %v", pod.Namespace, pod.Name, err)
-		a.setPhase(ctx, pod, corev1.PodFailed, "StartError", err.Error(), nil)
-	}
+	// Reserve the slot before the (possibly slow, image-pulling) start so
+	// the next reconcile tick doesn't start the pod twice.
+	vm = &podVM{podUID: pod.UID, name: pod.Name, ns: pod.Namespace, done: make(chan struct{})}
+	a.mu.Lock()
+	a.vms[pod.UID] = vm
+	a.mu.Unlock()
+
+	go func() {
+		if err := a.startPod(ctx, pod, vm); err != nil {
+			log.Printf("starting pod %s/%s: %v", pod.Namespace, pod.Name, err)
+			a.mu.Lock()
+			delete(a.vms, pod.UID)
+			a.mu.Unlock()
+			a.setPhase(ctx, pod, corev1.PodFailed, "StartError", err.Error(), nil)
+		}
+	}()
 }
 
-func (a *agent) startPod(ctx context.Context, pod *corev1.Pod) error {
+func (a *agent) startPod(ctx context.Context, pod *corev1.Pod, vm *podVM) error {
 	if len(pod.Spec.Containers) == 0 {
 		return fmt.Errorf("no containers")
 	}
 	c := pod.Spec.Containers[0]
+
+	// Pull the image (cached after first use).
+	rootfsBase, err := a.ensureImage(c.Image)
+	if err != nil {
+		return fmt.Errorf("pulling image %q: %w", c.Image, err)
+	}
 
 	dir := filepath.Join(a.workDir, string(pod.UID))
 	rootfs := filepath.Join(dir, "rootfs")
@@ -326,27 +353,33 @@ func (a *agent) startPod(ctx context.Context, pod *corev1.Pod) error {
 	}
 	// APFS clonefile copy of the base rootfs: instant, copy-on-write.
 	if _, err := os.Stat(rootfs); os.IsNotExist(err) {
-		if out, err := exec.Command("/bin/cp", "-Rc", a.rootfsBase, rootfs).CombinedOutput(); err != nil {
+		if out, err := exec.Command("/bin/cp", "-Rc", rootfsBase, rootfs).CombinedOutput(); err != nil {
 			return fmt.Errorf("cloning rootfs: %v: %s", err, out)
 		}
 	}
 
-	// The workload command travels as a script file in the guest rootfs:
-	// libkrun passes exec args via the kernel cmdline, which splits on
-	// whitespace, so argv goes out-of-band.
+	// The guest boots into execd, which supervises the workload (on a pty
+	// when the pod asks for one) and serves exec/attach over vsock. Workload
+	// argv travels in a spec file: libkrun passes exec args via the kernel
+	// cmdline, which splits on whitespace, so it must go out-of-band.
+	if out, err := exec.Command("/bin/cp", "-c", a.execdPath, filepath.Join(rootfs, "execd")).CombinedOutput(); err != nil {
+		return fmt.Errorf("installing execd: %v: %s", err, out)
+	}
 	argv := append(append([]string{}, c.Command...), c.Args...)
 	if len(argv) == 0 {
-		argv = []string{"/bin/sh", "-c", "echo kube-on-macos PoC: no command specified; sleep 30"}
+		argv = imageArgv(rootfsBase)
 	}
-	var sb strings.Builder
-	sb.WriteString("#!/bin/sh\nexec")
-	for _, arg := range argv {
-		sb.WriteString(" '")
-		sb.WriteString(strings.ReplaceAll(arg, "'", `'\''`))
-		sb.WriteString("'")
+	if len(argv) == 0 {
+		return fmt.Errorf("no command: pod spec has none and image config has no Entrypoint/Cmd")
 	}
-	sb.WriteString("\n")
-	if err := os.WriteFile(filepath.Join(rootfs, "entry.sh"), []byte(sb.String()), 0o755); err != nil {
+	specJSON, err := json.Marshal(map[string]any{"argv": argv, "tty": c.TTY})
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(rootfs, ".podvm-spec.json"), specJSON, 0o644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(rootfs, "entry.sh"), []byte("#!/bin/sh\nexec /execd\n"), 0o755); err != nil {
 		return err
 	}
 
@@ -370,6 +403,7 @@ func (a *agent) startPod(ctx context.Context, pod *corev1.Pod) error {
 		"--cpus", fmt.Sprintf("%d", cpus),
 		"--mem", fmt.Sprintf("%d", memMB),
 		"--log", filepath.Join(dir, "vmm.log"),
+		"--vsock-exec", execSockPath(pod.UID),
 		"--", "/bin/sh", "/entry.sh")
 	cmd.Stdout = logf
 	cmd.Stderr = logf
@@ -378,9 +412,8 @@ func (a *agent) startPod(ctx context.Context, pod *corev1.Pod) error {
 		return err
 	}
 
-	vm := &podVM{cmd: cmd, podUID: pod.UID, name: pod.Name, ns: pod.Namespace, done: make(chan struct{})}
 	a.mu.Lock()
-	a.vms[pod.UID] = vm
+	vm.cmd = cmd
 	a.mu.Unlock()
 	log.Printf("pod %s/%s: microVM started (pid %d, cpus=%d, mem=%dMiB)",
 		pod.Namespace, pod.Name, cmd.Process.Pid, cpus, memMB)
