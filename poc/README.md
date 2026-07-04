@@ -65,7 +65,10 @@ Prereqs: Xcode CLT, Homebrew (`rustup`, `llvm`, `lld`, `xz`), Go.
    `libkrun.2.dylib`, re-point it:
    `install_name_tool -change libkrun.2.dylib @rpath/libkrun.dylib podvm`
    and re-sign).
-5. Envtest binaries:
+5. gvproxy (outbound pod networking): build from
+   github.com/containers/gvisor-tap-vsock (`go build ./cmd/gvproxy`) into
+   `_artifacts/gvproxy`.
+6. Envtest binaries:
    `go run sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.21 use 1.33.0 --bin-dir _artifacts/envtest -p path`
 6. `cd agent && go build -o agent . && ./agent --assets ../_artifacts/envtest/k8s/1.33.0-darwin-arm64`
 7. In another shell:
@@ -98,9 +101,18 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
   (future work): serve the image as a real Linux filesystem in a block
   image (EROFS/ext4 lower + writable upper), keeping virtiofs for
   configMap/secret-style shares and DAX.
-- **No pod networking**: no IPs, no services. TSI was deliberately disabled
-  (it needs libkrunfw's patched kernel); the real design is routed IPv6 via
-  virtio-net + guest-side service LB.
+- **Outbound networking works; inbound/services don't yet.** Each pod VM
+  gets a virtio-net device backed by a per-pod gvproxy instance (userspace
+  NAT via gvisor netstack, vfkit unixgram protocol, no root needed); execd
+  configures the interface statically via netlink (192.168.127.2/24, gw+DNS
+  at .1) since images can't be assumed to ship iproute2. `apt-get update`
+  and `apt-get install` work from a debian pod. Explicitly interim: this is
+  userspace on the data path and every pod has the same private IP behind
+  its own NAT — no pod IPs in status, no pod-to-pod traffic, no services.
+  The real design (routed IPv6 via vmnet, guest-side service LB) replaces
+  it; the virtio-net guest plumbing built here carries over unchanged
+  (libkrun's unixgram backend takes vmnet-helper the same way it takes
+  gvproxy).
 - **Partial kubelet server**: `kubectl logs` (with `-f`, `--tail`),
   `kubectl exec` (including `-it` with pty + resize + exit codes), and
   `kubectl attach` (so `kubectl run -it --image=debian:latest -- bash`

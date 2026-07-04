@@ -73,6 +73,15 @@ func execSockPath(uid types.UID) string {
 	return filepath.Join("/tmp", "podvm-"+short+".sock")
 }
 
+// netSockPath is the gvproxy vfkit-protocol unixgram socket for a pod VM.
+func netSockPath(uid types.UID) string {
+	short := string(uid)
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	return filepath.Join("/tmp", "podvm-"+short+".net")
+}
+
 // dialExecd connects to the pod VM's exec socket, retrying briefly: the
 // socket exists from VM creation but the guest daemon needs a moment to
 // start listening.

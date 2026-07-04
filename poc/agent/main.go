@@ -88,6 +88,17 @@ func (a *agent) killVM(vm *podVM, grace int64, reason string) {
 	})
 }
 
+func waitForSocket(path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("socket %s did not appear within %s", path, timeout)
+}
+
 func podGracePeriod(pod *corev1.Pod) int64 {
 	if pod.DeletionGracePeriodSeconds != nil {
 		return *pod.DeletionGracePeriodSeconds
@@ -107,6 +118,7 @@ type agent struct {
 	workDir     string
 	imagesDir   string
 	execdPath   string
+	gvproxyPath string
 	kubeletPort int
 
 	mu  sync.Mutex
@@ -122,13 +134,14 @@ func main() {
 		workDir       = flag.String("work-dir", "../_artifacts/pods", "per-pod state dir")
 		imagesDir     = flag.String("images-dir", "../_artifacts/images", "pulled-image rootfs cache")
 		execdPath     = flag.String("execd", "../_artifacts/execd", "path to the guest execd binary (linux/arm64)")
+		gvproxyPath   = flag.String("gvproxy", "../_artifacts/gvproxy", "path to gvproxy (outbound pod networking; empty to disable)")
 		assetsDir     = flag.String("assets", "", "envtest binary assets dir (kube-apiserver, etcd)")
 		kubeconfigOut = flag.String("kubeconfig-out", "../_artifacts/kubeconfig", "where to write admin kubeconfig")
 		kubeletPort   = flag.Int("kubelet-port", 10250, "port for the kubelet server (kubectl logs)")
 	)
 	flag.Parse()
 
-	for _, p := range []*string{harness, kernel, rootfsBase, workDir, kubeconfigOut, imagesDir, execdPath} {
+	for _, p := range []*string{harness, kernel, rootfsBase, workDir, kubeconfigOut, imagesDir, execdPath, gvproxyPath} {
 		abs, err := filepath.Abs(*p)
 		if err != nil {
 			log.Fatalf("abs %q: %v", *p, err)
@@ -179,6 +192,7 @@ func main() {
 		workDir:     *workDir,
 		imagesDir:   *imagesDir,
 		execdPath:   *execdPath,
+		gvproxyPath: *gvproxyPath,
 		kubeletPort: *kubeletPort,
 		vms:         map[types.UID]*podVM{},
 	}
@@ -426,18 +440,55 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			fail("StartError", err)
 			return
 		}
-		cmd := exec.Command(a.harness,
+
+		// Per-pod gvproxy: userspace NAT giving the guest outbound
+		// networking (interim until the routed-IPv6 data plane).
+		harnessArgs := []string{
 			"--kernel", a.kernel,
 			"--rootfs", rootfs,
 			"--cpus", fmt.Sprintf("%d", cpus),
 			"--mem", fmt.Sprintf("%d", memMB),
 			"--log", filepath.Join(dir, "vmm.log"),
 			"--vsock-exec", execSockPath(pod.UID),
-			"--", "/bin/sh", "/entry.sh")
+		}
+		var gvp *exec.Cmd
+		if a.gvproxyPath != "" {
+			netSock := netSockPath(pod.UID)
+			os.Remove(netSock)
+			gvlog, err := os.Create(filepath.Join(dir, "gvproxy.log"))
+			if err != nil {
+				logf.Close()
+				fail("StartError", err)
+				return
+			}
+			// -ssh-port -1 disables gvproxy's default 127.0.0.1:2222
+			// forward, which would collide across per-pod instances.
+			gvp = exec.Command(a.gvproxyPath, "-listen-vfkit", "unixgram://"+netSock, "-ssh-port", "-1")
+			gvp.Stdout, gvp.Stderr = gvlog, gvlog
+			if err := gvp.Start(); err != nil {
+				logf.Close()
+				gvlog.Close()
+				fail("StartError", fmt.Errorf("starting gvproxy: %w", err))
+				return
+			}
+			if err := waitForSocket(netSock, 5*time.Second); err != nil {
+				gvp.Process.Kill()
+				logf.Close()
+				fail("StartError", err)
+				return
+			}
+			harnessArgs = append(harnessArgs, "--net-socket", netSock)
+		}
+		harnessArgs = append(harnessArgs, "--", "/bin/sh", "/entry.sh")
+
+		cmd := exec.Command(a.harness, harnessArgs...)
 		cmd.Stdout = logf
 		cmd.Stderr = logf
 		if err := cmd.Start(); err != nil {
 			logf.Close()
+			if gvp != nil {
+				gvp.Process.Kill()
+			}
 			fail("StartError", err)
 			return
 		}
@@ -464,6 +515,10 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 		err = cmd.Wait()
 		close(probeStop)
 		logf.Close()
+		if gvp != nil {
+			gvp.Process.Kill()
+			gvp.Wait()
+		}
 
 		exitCode := int32(0)
 		csReason := "Completed"
@@ -585,7 +640,9 @@ func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string) (string, err
 		}
 	}
 	// APFS clonefile copy of the base rootfs: instant, copy-on-write.
-	if out, err := exec.Command("/bin/cp", "-Rc", rootfsBase, rootfs).CombinedOutput(); err != nil {
+	// -p matters: without it, directories are recreated subject to the
+	// umask, silently stripping e.g. /tmp's 1777 down to 1755.
+	if out, err := exec.Command("/bin/cp", "-Rpc", rootfsBase, rootfs).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("cloning rootfs: %v: %s", err, out)
 	}
 
@@ -603,7 +660,17 @@ func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string) (string, err
 	if len(argv) == 0 {
 		return "", fmt.Errorf("no command: pod spec has none and image config has no Entrypoint/Cmd")
 	}
-	specJSON, err := json.Marshal(map[string]any{"argv": argv, "tty": c.TTY})
+	specData := map[string]any{"argv": argv, "tty": c.TTY}
+	if a.gvproxyPath != "" {
+		// gvproxy's virtual network: 192.168.127.0/24, gateway+DNS at .1.
+		// Per-pod gvproxy instance, so the guest address can be fixed.
+		specData["net"] = map[string]string{
+			"ip":  "192.168.127.2/24",
+			"gw":  "192.168.127.1",
+			"dns": "192.168.127.1",
+		}
+	}
+	specJSON, err := json.Marshal(specData)
 	if err != nil {
 		return "", err
 	}

@@ -50,6 +50,7 @@ int main(int argc, char *const argv[])
     const char *rootfs = NULL;
     const char *log_path = NULL;
     const char *vsock_exec_path = NULL;
+    const char *net_socket_path = NULL;
     long cpus = 1;
     long mem_mib = 256;
     long dax_mib = 0;
@@ -62,12 +63,13 @@ int main(int argc, char *const argv[])
         { "dax-mb", required_argument, NULL, 'd' },
         { "log", required_argument, NULL, 'l' },
         { "vsock-exec", required_argument, NULL, 'x' },
+        { "net-socket", required_argument, NULL, 'n' },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "+k:r:c:m:d:l:x:h", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "+k:r:c:m:d:l:x:n:h", opts, NULL)) != -1) {
         switch (c) {
         case 'k': kernel_path = optarg; break;
         case 'r': rootfs = optarg; break;
@@ -76,6 +78,7 @@ int main(int argc, char *const argv[])
         case 'd': dax_mib = atol(optarg); break;
         case 'l': log_path = optarg; break;
         case 'x': vsock_exec_path = optarg; break;
+        case 'n': net_socket_path = optarg; break;
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 1;
         }
@@ -145,6 +148,16 @@ int main(int argc, char *const argv[])
      * virtio-net); vsock is here as the control-channel substrate. */
     if (check(krun_add_vsock(ctx, 0), "krun_add_vsock"))
         return 1;
+
+    /* virtio-net backed by a gvproxy vfkit-protocol unixgram socket.
+     * Adding a net device implicitly disables libkrun's TSI fallback. */
+    if (net_socket_path != NULL) {
+        uint8_t mac[6] = { 0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee };
+        if (check(krun_add_net_unixgram(ctx, net_socket_path, -1, mac,
+                                        COMPAT_NET_FEATURES, NET_FLAG_VFKIT),
+                  "krun_add_net_unixgram"))
+            return 1;
+    }
 
     /* Expose guest vsock port 1024 (execd) as a host unix socket the node
      * agent dials for exec/attach sessions. */

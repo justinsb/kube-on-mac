@@ -55,6 +55,13 @@ func (a *agent) ensureImage(image string) (string, error) {
 		os.RemoveAll(tmp)
 		return "", fmt.Errorf("extracting image: %w", err)
 	}
+	// World-writable sticky temp dirs, whether or not the image's tar
+	// carried explicit entries for them.
+	for _, d := range []string{"tmp", "var/tmp"} {
+		p := filepath.Join(tmp, d)
+		os.MkdirAll(p, 0o755)
+		os.Chmod(p, 0o777|os.ModeSticky)
+	}
 
 	if cf, err := img.ConfigFile(); err == nil {
 		if data, err := json.Marshal(cf); err == nil {
@@ -98,7 +105,10 @@ func untar(r io.Reader, dest string) error {
 		if !strings.HasPrefix(target, filepath.Clean(dest)+string(os.PathSeparator)) && target != filepath.Clean(dest) {
 			continue
 		}
-		mode := os.FileMode(hdr.Mode & 0o7777)
+		// FileInfo().Mode() maps tar's setuid/setgid/sticky bits onto
+		// os.FileMode flags; raw hdr.Mode would silently drop them (e.g.
+		// /tmp ending up 0755 instead of 1777, breaking apt's _apt user).
+		mode := hdr.FileInfo().Mode()
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, 0o755); err != nil {

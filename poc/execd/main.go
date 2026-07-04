@@ -39,6 +39,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/mdlayher/vsock"
+	"github.com/vishvananda/netlink"
 )
 
 const (
@@ -74,6 +75,50 @@ type request struct {
 type spec struct {
 	Argv []string `json:"argv"`
 	TTY  bool     `json:"tty"`
+	Net  *netSpec `json:"net,omitempty"`
+}
+
+type netSpec struct {
+	IP  string `json:"ip"`  // CIDR, e.g. 192.168.127.2/24
+	GW  string `json:"gw"`  // e.g. 192.168.127.1
+	DNS string `json:"dns"` // e.g. 192.168.127.1
+}
+
+// configureNet brings up lo and eth0 with a static address via netlink —
+// images can't be assumed to ship iproute2, so we do it ourselves.
+func configureNet(ns *netSpec) error {
+	if lo, err := netlink.LinkByName("lo"); err == nil {
+		netlink.LinkSetUp(lo)
+	}
+	eth0, err := netlink.LinkByName("eth0")
+	if err != nil {
+		return fmt.Errorf("no eth0: %w", err)
+	}
+	addr, err := netlink.ParseAddr(ns.IP)
+	if err != nil {
+		return fmt.Errorf("parsing ip %q: %w", ns.IP, err)
+	}
+	if err := netlink.AddrAdd(eth0, addr); err != nil {
+		return fmt.Errorf("adding address: %w", err)
+	}
+	if err := netlink.LinkSetUp(eth0); err != nil {
+		return fmt.Errorf("link up: %w", err)
+	}
+	gw := net.ParseIP(ns.GW)
+	if gw == nil {
+		return fmt.Errorf("bad gateway %q", ns.GW)
+	}
+	if err := netlink.RouteAdd(&netlink.Route{
+		LinkIndex: eth0.Attrs().Index,
+		Gw:        gw,
+	}); err != nil {
+		return fmt.Errorf("adding default route: %w", err)
+	}
+	if ns.DNS != "" {
+		os.WriteFile("/etc/resolv.conf",
+			[]byte("nameserver "+ns.DNS+"\n"), 0o644)
+	}
+	return nil
 }
 
 func defaultEnv() []string {
@@ -175,6 +220,14 @@ func main() {
 	}
 	if len(sp.Argv) == 0 {
 		log.Fatalf("empty argv in spec")
+	}
+
+	if sp.Net != nil {
+		if err := configureNet(sp.Net); err != nil {
+			log.Printf("configuring network: %v (continuing without)", err)
+		} else {
+			log.Printf("network up: %s via %s", sp.Net.IP, sp.Net.GW)
+		}
 	}
 
 	wl := &workload{}
