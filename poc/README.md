@@ -99,6 +99,17 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
   using kubelet's own streaming library. Still missing: authn/authz on the
   endpoint (delegated TokenReview/SubjectAccessReview), `port-forward`,
   and multi-attach (one attach session at a time).
+- **Probes and lifecycle are real**: startup/readiness/liveness probes with
+  thresholds/periods/initialDelay; exec probes run via the exec channel,
+  httpGet/tcpSocket probes run *inside* the guest via execd (the moral
+  equivalent of kubelet probing the pod IP — localhost in the pod VM is the
+  pod's network view). Graceful termination delivers SIGTERM in the guest
+  and escalates to SIGKILL after the grace period (host-side harness kill
+  as backstop). restartPolicy is honored with a naive doubling crash
+  backoff; each restart is a fresh microVM but the pod rootfs is currently
+  reused across restarts (real kubelet gives restarted containers a fresh
+  filesystem). Named probe ports and lifecycle hooks (postStart/preStop)
+  are not implemented.
 - **In-guest supervision** is `execd` (poc/execd): a static Go daemon that
   libkrun's init execs; it runs the workload (on a pty when the pod sets
   `tty: true`), mirrors output to the console log, and serves exec/attach

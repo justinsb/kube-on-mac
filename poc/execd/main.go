@@ -22,14 +22,20 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/mdlayher/vsock"
@@ -53,6 +59,16 @@ type request struct {
 	TTY  bool     `json:"tty,omitempty"`
 	Cols uint16   `json:"cols,omitempty"`
 	Rows uint16   `json:"rows,omitempty"`
+
+	// probe
+	Ptype   string `json:"ptype,omitempty"` // "tcp" or "http"
+	Port    int    `json:"port,omitempty"`
+	Path    string `json:"path,omitempty"`
+	Scheme  string `json:"scheme,omitempty"`
+	Timeout int    `json:"timeout,omitempty"` // seconds
+
+	// shutdown
+	Grace int `json:"grace,omitempty"` // seconds between SIGTERM and SIGKILL
 }
 
 type spec struct {
@@ -115,6 +131,7 @@ func (w *frameWriter) Write(p []byte) (int, error) {
 // workload is the supervised main process.
 type workload struct {
 	mu       sync.Mutex
+	cmd      *exec.Cmd
 	ptyFile  *os.File // non-nil when running on a pty
 	stdinW   io.WriteCloser
 	attached *framedConn // at most one attach session
@@ -140,7 +157,13 @@ func (wl *workload) Write(p []byte) (int, error) {
 
 func main() {
 	log.SetPrefix("execd: ")
-	log.SetFlags(0)
+	log.SetFlags(log.LstdFlags)
+	// Keep execd's own chatter out of the workload's stdout/stderr (the
+	// virtio console feeds container.log). The rootfs is a virtiofs share,
+	// so this file is visible host-side at pods/<uid>/rootfs/.execd.log.
+	if f, err := os.OpenFile("/.execd.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+		log.SetOutput(f)
+	}
 
 	data, err := os.ReadFile("/.podvm-spec.json")
 	if err != nil {
@@ -157,6 +180,7 @@ func main() {
 	wl := &workload{}
 	cmd := exec.Command(sp.Argv[0], sp.Argv[1:]...)
 	cmd.Env = defaultEnv()
+	wl.cmd = cmd
 
 	if sp.TTY {
 		f, err := pty.Start(cmd)
@@ -221,7 +245,81 @@ func handleConn(fc *framedConn, wl *workload) {
 		handleExec(fc, req)
 	case "attach":
 		handleAttach(fc, wl)
+	case "probe":
+		handleProbe(fc, req)
+	case "shutdown":
+		handleShutdown(fc, req, wl)
 	}
+}
+
+// handleProbe implements tcpSocket/httpGet probes from inside the pod's
+// network view — the equivalent of kubelet probing the pod IP.
+func handleProbe(fc *framedConn, req request) {
+	timeout := time.Duration(req.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = time.Second
+	}
+	addr := fmt.Sprintf("127.0.0.1:%d", req.Port)
+	fail := func(msg string) {
+		fc.writeFrame(frameExit, []byte(fmt.Sprintf(`{"code":1,"error":%q}`, msg)))
+	}
+	switch req.Ptype {
+	case "tcp":
+		c, err := net.DialTimeout("tcp", addr, timeout)
+		if err != nil {
+			fail(err.Error())
+			return
+		}
+		c.Close()
+	case "http":
+		scheme := req.Scheme
+		if scheme == "" {
+			scheme = "http"
+		}
+		path := req.Path
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		client := &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
+		resp, err := client.Get(fmt.Sprintf("%s://%s%s", scheme, addr, path))
+		if err != nil {
+			fail(err.Error())
+			return
+		}
+		resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+			fail(fmt.Sprintf("HTTP probe returned status %d", resp.StatusCode))
+			return
+		}
+	default:
+		fail("unknown probe type " + req.Ptype)
+		return
+	}
+	fc.writeFrame(frameExit, []byte(`{"code":0}`))
+}
+
+// handleShutdown delivers SIGTERM to the workload and escalates to SIGKILL
+// after the grace period. The VM exits when the workload does.
+func handleShutdown(fc *framedConn, req request, wl *workload) {
+	wl.mu.Lock()
+	cmd := wl.cmd
+	wl.mu.Unlock()
+	if cmd == nil || cmd.Process == nil {
+		fc.writeFrame(frameExit, []byte(`{"code":1,"error":"no workload"}`))
+		return
+	}
+	grace := time.Duration(req.Grace) * time.Second
+	log.Printf("shutdown requested (grace %s)", grace)
+	cmd.Process.Signal(syscall.SIGTERM)
+	time.AfterFunc(grace, func() {
+		cmd.Process.Kill()
+	})
+	fc.writeFrame(frameExit, []byte(`{"code":0}`))
 }
 
 func handleAttach(fc *framedConn, wl *workload) {

@@ -180,6 +180,45 @@ func (a *agent) session(ctx context.Context, uid types.UID, req map[string]any,
 	}
 }
 
+// execdRequest performs a request/response op against execd (probe,
+// shutdown): sends the request frame, waits for the exit frame, discarding
+// any stream frames. Non-zero exit codes come back as CodeExitError.
+func (a *agent) execdRequest(uid types.UID, req map[string]any, timeout time.Duration) error {
+	fc, err := a.dialExecd(uid)
+	if err != nil {
+		return err
+	}
+	defer fc.c.Close()
+	fc.c.SetDeadline(time.Now().Add(timeout + 5*time.Second))
+
+	reqData, _ := json.Marshal(req)
+	if err := fc.writeFrame(frameRequest, reqData); err != nil {
+		return err
+	}
+	for {
+		typ, payload, err := fc.readFrame()
+		if err != nil {
+			return err
+		}
+		if typ != frameExit {
+			continue
+		}
+		var e struct {
+			Code  int    `json:"code"`
+			Error string `json:"error"`
+		}
+		json.Unmarshal(payload, &e)
+		if e.Code == 0 {
+			return nil
+		}
+		msg := e.Error
+		if msg == "" {
+			msg = fmt.Sprintf("exit code %d", e.Code)
+		}
+		return utilexec.CodeExitError{Err: fmt.Errorf("%s", msg), Code: e.Code}
+	}
+}
+
 // ExecInContainer implements the kubelet streaming Executor interface.
 func (a *agent) ExecInContainer(ctx context.Context, name string, uid types.UID, container string,
 	cmd []string, in io.Reader, out, errw io.WriteCloser, tty bool,

@@ -6,9 +6,12 @@
 // into a Linux microVM launched through the podvm harness (libkrun on
 // Hypervisor.framework). Pod phase/status is reported back honestly.
 //
-// Deliberately NOT the kubelet contract yet: no :10250 server (exec/logs/
-// port-forward), no probes, no volumes beyond the rootfs, image field is
-// ignored (all pods run the shared Alpine rootfs), no pod networking.
+// Implemented so far: real image pulls (flattened, cached), kubectl
+// logs/exec/attach via the :10250 kubelet server, startup/readiness/liveness
+// probes (exec + in-guest http/tcp via execd), graceful termination
+// (SIGTERM in the guest, SIGKILL after grace), restartPolicy with naive
+// crash backoff. Still missing: port-forward, volumes beyond the rootfs,
+// pod networking, authn/authz on the kubelet server.
 package main
 
 import (
@@ -35,12 +38,64 @@ import (
 )
 
 type podVM struct {
-	cmd     *exec.Cmd
-	podUID  types.UID
-	name    string
-	ns      string
-	done    chan struct{}
-	exitErr error
+	podUID types.UID
+	name   string
+	ns     string
+
+	mu       sync.Mutex
+	cmd      *exec.Cmd
+	ready    bool
+	stopping bool
+	restarts int32
+	stopOnce sync.Once
+}
+
+func (vm *podVM) setCmd(c *exec.Cmd) { vm.mu.Lock(); vm.cmd = c; vm.mu.Unlock() }
+func (vm *podVM) getCmd() *exec.Cmd  { vm.mu.Lock(); defer vm.mu.Unlock(); return vm.cmd }
+func (vm *podVM) setReady(r bool) bool {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+	changed := vm.ready != r
+	vm.ready = r
+	return changed
+}
+func (vm *podVM) getReady() bool   { vm.mu.Lock(); defer vm.mu.Unlock(); return vm.ready }
+func (vm *podVM) setStopping()     { vm.mu.Lock(); vm.stopping = true; vm.mu.Unlock() }
+func (vm *podVM) isStopping() bool { vm.mu.Lock(); defer vm.mu.Unlock(); return vm.stopping }
+func (vm *podVM) restartCount() int32 {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+	return vm.restarts
+}
+
+// killVM asks execd to SIGTERM the workload, escalating to SIGKILL in the
+// guest after the grace period; as a backstop the harness process itself is
+// killed a bit after that (e.g. execd unreachable during early boot).
+func (a *agent) killVM(vm *podVM, grace int64, reason string) {
+	log.Printf("pod %s/%s: stopping VM (%s, grace %ds)", vm.ns, vm.name, reason, grace)
+	if err := a.execdRequest(vm.podUID, map[string]any{"op": "shutdown", "grace": grace},
+		5*time.Second); err != nil {
+		log.Printf("pod %s/%s: graceful shutdown unavailable (%v); killing VM", vm.ns, vm.name, err)
+		if cmd := vm.getCmd(); cmd != nil && cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		return
+	}
+	time.AfterFunc(time.Duration(grace)*time.Second+5*time.Second, func() {
+		if cmd := vm.getCmd(); cmd != nil && cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+	})
+}
+
+func podGracePeriod(pod *corev1.Pod) int64 {
+	if pod.DeletionGracePeriodSeconds != nil {
+		return *pod.DeletionGracePeriodSeconds
+	}
+	if pod.Spec.TerminationGracePeriodSeconds != nil {
+		return *pod.Spec.TerminationGracePeriodSeconds
+	}
+	return 30
 }
 
 type agent struct {
@@ -165,10 +220,10 @@ func (a *agent) registerNode(ctx context.Context) error {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: a.nodeName,
 			Labels: map[string]string{
-				"kubernetes.io/os":          "linux",
-				"kubernetes.io/arch":        "arm64",
-				"kubernetes.io/hostname":    a.nodeName,
-				"kube-on-macos.io/runtime":  "vm",
+				"kubernetes.io/os":           "linux",
+				"kubernetes.io/arch":         "arm64",
+				"kubernetes.io/hostname":     a.nodeName,
+				"kube-on-macos.io/runtime":   "vm",
 				"node.kubernetes.io/os-host": "darwin",
 			},
 		},
@@ -299,16 +354,17 @@ func (a *agent) reconcilePod(ctx context.Context, pod *corev1.Pod) {
 	a.mu.Unlock()
 
 	if pod.DeletionTimestamp != nil {
-		if running && vm.cmd != nil && vm.cmd.Process != nil {
-			log.Printf("pod %s/%s deleted; killing VM", pod.Namespace, pod.Name)
-			vm.cmd.Process.Signal(syscall.SIGTERM)
+		if !running {
+			// Nothing running (never started, or already exited): finalize.
+			zero := int64(0)
+			a.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+			return
 		}
-		zero := int64(0)
-		a.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
-			metav1.DeleteOptions{GracePeriodSeconds: &zero})
-		a.mu.Lock()
-		delete(a.vms, pod.UID)
-		a.mu.Unlock()
+		vm.stopOnce.Do(func() {
+			vm.setStopping()
+			go a.killVM(vm, podGracePeriod(pod), "pod deleted")
+		})
 		return
 	}
 
@@ -318,70 +374,34 @@ func (a *agent) reconcilePod(ctx context.Context, pod *corev1.Pod) {
 
 	// Reserve the slot before the (possibly slow, image-pulling) start so
 	// the next reconcile tick doesn't start the pod twice.
-	vm = &podVM{podUID: pod.UID, name: pod.Name, ns: pod.Namespace, done: make(chan struct{})}
+	vm = &podVM{podUID: pod.UID, name: pod.Name, ns: pod.Namespace}
 	a.mu.Lock()
 	a.vms[pod.UID] = vm
 	a.mu.Unlock()
 
-	go func() {
-		if err := a.startPod(ctx, pod, vm); err != nil {
-			log.Printf("starting pod %s/%s: %v", pod.Namespace, pod.Name, err)
-			a.mu.Lock()
-			delete(a.vms, pod.UID)
-			a.mu.Unlock()
-			a.setPhase(ctx, pod, corev1.PodFailed, "StartError", err.Error(), nil)
-		}
-	}()
+	go a.runPod(ctx, pod, vm)
 }
 
-func (a *agent) startPod(ctx context.Context, pod *corev1.Pod, vm *podVM) error {
-	if len(pod.Spec.Containers) == 0 {
-		return fmt.Errorf("no containers")
+// runPod owns a pod's whole lifecycle: prepare rootfs, then a supervise
+// loop — start VM, run probes, wait, restart per restartPolicy.
+func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
+	defer func() {
+		a.mu.Lock()
+		delete(a.vms, pod.UID)
+		a.mu.Unlock()
+	}()
+
+	fail := func(reason string, err error) {
+		log.Printf("pod %s/%s: %s: %v", pod.Namespace, pod.Name, reason, err)
+		a.setPhase(ctx, pod, corev1.PodFailed, reason, err.Error(), nil)
+	}
+
+	dir, rootfs, err := a.preparePod(pod)
+	if err != nil {
+		fail("StartError", err)
+		return
 	}
 	c := pod.Spec.Containers[0]
-
-	// Pull the image (cached after first use).
-	rootfsBase, err := a.ensureImage(c.Image)
-	if err != nil {
-		return fmt.Errorf("pulling image %q: %w", c.Image, err)
-	}
-
-	dir := filepath.Join(a.workDir, string(pod.UID))
-	rootfs := filepath.Join(dir, "rootfs")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	// APFS clonefile copy of the base rootfs: instant, copy-on-write.
-	if _, err := os.Stat(rootfs); os.IsNotExist(err) {
-		if out, err := exec.Command("/bin/cp", "-Rc", rootfsBase, rootfs).CombinedOutput(); err != nil {
-			return fmt.Errorf("cloning rootfs: %v: %s", err, out)
-		}
-	}
-
-	// The guest boots into execd, which supervises the workload (on a pty
-	// when the pod asks for one) and serves exec/attach over vsock. Workload
-	// argv travels in a spec file: libkrun passes exec args via the kernel
-	// cmdline, which splits on whitespace, so it must go out-of-band.
-	if out, err := exec.Command("/bin/cp", "-c", a.execdPath, filepath.Join(rootfs, "execd")).CombinedOutput(); err != nil {
-		return fmt.Errorf("installing execd: %v: %s", err, out)
-	}
-	argv := append(append([]string{}, c.Command...), c.Args...)
-	if len(argv) == 0 {
-		argv = imageArgv(rootfsBase)
-	}
-	if len(argv) == 0 {
-		return fmt.Errorf("no command: pod spec has none and image config has no Entrypoint/Cmd")
-	}
-	specJSON, err := json.Marshal(map[string]any{"argv": argv, "tty": c.TTY})
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(rootfs, ".podvm-spec.json"), specJSON, 0o644); err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(rootfs, "entry.sh"), []byte("#!/bin/sh\nexec /execd\n"), 0o755); err != nil {
-		return err
-	}
 
 	memMB := int64(256)
 	if m, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
@@ -392,77 +412,187 @@ func (a *agent) startPod(ctx context.Context, pod *corev1.Pod, vm *podVM) error 
 		cpus = q.Value()
 	}
 
-	logf, err := os.Create(filepath.Join(dir, "container.log"))
-	if err != nil {
-		return err
-	}
+	for attempt := 0; ; attempt++ {
+		logf, err := os.OpenFile(filepath.Join(dir, "container.log"),
+			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			fail("StartError", err)
+			return
+		}
+		cmd := exec.Command(a.harness,
+			"--kernel", a.kernel,
+			"--rootfs", rootfs,
+			"--cpus", fmt.Sprintf("%d", cpus),
+			"--mem", fmt.Sprintf("%d", memMB),
+			"--log", filepath.Join(dir, "vmm.log"),
+			"--vsock-exec", execSockPath(pod.UID),
+			"--", "/bin/sh", "/entry.sh")
+		cmd.Stdout = logf
+		cmd.Stderr = logf
+		if err := cmd.Start(); err != nil {
+			logf.Close()
+			fail("StartError", err)
+			return
+		}
+		vm.setCmd(cmd)
+		log.Printf("pod %s/%s: microVM started (pid %d, cpus=%d, mem=%dMiB, restarts=%d)",
+			pod.Namespace, pod.Name, cmd.Process.Pid, cpus, memMB, vm.restartCount())
 
-	cmd := exec.Command(a.harness,
-		"--kernel", a.kernel,
-		"--rootfs", rootfs,
-		"--cpus", fmt.Sprintf("%d", cpus),
-		"--mem", fmt.Sprintf("%d", memMB),
-		"--log", filepath.Join(dir, "vmm.log"),
-		"--vsock-exec", execSockPath(pod.UID),
-		"--", "/bin/sh", "/entry.sh")
-	cmd.Stdout = logf
-	cmd.Stderr = logf
-	if err := cmd.Start(); err != nil {
+		started := metav1.Now()
+		// Ready immediately only if there's no readiness (or startup) probe.
+		vm.setReady(c.ReadinessProbe == nil && c.StartupProbe == nil)
+		a.setPhase(ctx, pod, corev1.PodRunning, "", "", &corev1.ContainerStatus{
+			Name:         c.Name,
+			Ready:        vm.getReady(),
+			RestartCount: vm.restartCount(),
+			State: corev1.ContainerState{
+				Running: &corev1.ContainerStateRunning{StartedAt: started},
+			},
+			Image: c.Image,
+		})
+
+		probeStop := make(chan struct{})
+		go a.runProbes(ctx, pod, vm, probeStop)
+
+		err = cmd.Wait()
+		close(probeStop)
 		logf.Close()
-		return err
-	}
 
-	a.mu.Lock()
-	vm.cmd = cmd
-	a.mu.Unlock()
-	log.Printf("pod %s/%s: microVM started (pid %d, cpus=%d, mem=%dMiB)",
-		pod.Namespace, pod.Name, cmd.Process.Pid, cpus, memMB)
-
-	started := metav1.Now()
-	a.setPhase(ctx, pod, corev1.PodRunning, "", "", &corev1.ContainerStatus{
-		Name:  c.Name,
-		Ready: true,
-		State: corev1.ContainerState{
-			Running: &corev1.ContainerStateRunning{StartedAt: started},
-		},
-		Image:   c.Image,
-		ImageID: "podvm://shared-alpine-rootfs",
-	})
-
-	go func() {
-		defer logf.Close()
-		err := cmd.Wait()
-		close(vm.done)
 		exitCode := int32(0)
-		phase := corev1.PodSucceeded
 		csReason := "Completed"
 		if err != nil {
-			phase = corev1.PodFailed
 			csReason = "Error"
+			exitCode = 1
 			if ee, ok := err.(*exec.ExitError); ok {
 				exitCode = int32(ee.ExitCode())
 			}
 		}
-		log.Printf("pod %s/%s: microVM exited (code %d)", pod.Namespace, pod.Name, exitCode)
-		a.setPhase(context.Background(), pod, phase, "", "", &corev1.ContainerStatus{
-			Name:  c.Name,
-			Ready: false,
+		finished := metav1.Now()
+		terminated := &corev1.ContainerStatus{
+			Name:         c.Name,
+			Ready:        false,
+			RestartCount: vm.restartCount(),
 			State: corev1.ContainerState{
 				Terminated: &corev1.ContainerStateTerminated{
 					ExitCode:   exitCode,
 					Reason:     csReason,
 					StartedAt:  started,
-					FinishedAt: metav1.Now(),
+					FinishedAt: finished,
 				},
 			},
-			Image:   c.Image,
-			ImageID: "podvm://shared-alpine-rootfs",
-		})
-		a.mu.Lock()
-		delete(a.vms, pod.UID)
-		a.mu.Unlock()
-	}()
-	return nil
+			Image: c.Image,
+		}
+		log.Printf("pod %s/%s: microVM exited (code %d)", pod.Namespace, pod.Name, exitCode)
+
+		if vm.isStopping() {
+			// Deletion in progress: report final state and finalize.
+			phase := corev1.PodSucceeded
+			if exitCode != 0 {
+				phase = corev1.PodFailed
+			}
+			a.setPhase(context.Background(), pod, phase, "", "", terminated)
+			zero := int64(0)
+			a.client.CoreV1().Pods(pod.Namespace).Delete(context.Background(), pod.Name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+			return
+		}
+
+		policy := pod.Spec.RestartPolicy
+		if policy == "" {
+			policy = corev1.RestartPolicyAlways
+		}
+		if policy == corev1.RestartPolicyNever ||
+			(policy == corev1.RestartPolicyOnFailure && exitCode == 0) {
+			phase := corev1.PodSucceeded
+			if exitCode != 0 {
+				phase = corev1.PodFailed
+			}
+			a.setPhase(context.Background(), pod, phase, "", "", terminated)
+			return
+		}
+
+		// Restarting. Naive crash backoff, reset after a long healthy run.
+		if finished.Sub(started.Time) > 5*time.Minute {
+			attempt = 0
+		}
+		backoff := time.Duration(1<<min(attempt, 5)) * time.Second
+		vm.mu.Lock()
+		vm.restarts++
+		vm.mu.Unlock()
+		terminated.State = corev1.ContainerState{
+			Waiting: &corev1.ContainerStateWaiting{
+				Reason:  "CrashLoopBackOff",
+				Message: fmt.Sprintf("restarting in %s", backoff),
+			},
+		}
+		terminated.RestartCount = vm.restartCount()
+		a.setPhase(context.Background(), pod, corev1.PodRunning, "", "", terminated)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if vm.isStopping() {
+			zero := int64(0)
+			a.client.CoreV1().Pods(pod.Namespace).Delete(context.Background(), pod.Name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+			return
+		}
+	}
+}
+
+// preparePod pulls the image and materializes the pod's rootfs. Note: the
+// rootfs is reused across container restarts (real kubelet gives restarted
+// containers a fresh filesystem).
+func (a *agent) preparePod(pod *corev1.Pod) (string, string, error) {
+	if len(pod.Spec.Containers) == 0 {
+		return "", "", fmt.Errorf("no containers")
+	}
+	c := pod.Spec.Containers[0]
+
+	// Pull the image (cached after first use).
+	rootfsBase, err := a.ensureImage(c.Image)
+	if err != nil {
+		return "", "", fmt.Errorf("pulling image %q: %w", c.Image, err)
+	}
+
+	dir := filepath.Join(a.workDir, string(pod.UID))
+	rootfs := filepath.Join(dir, "rootfs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", "", err
+	}
+	// APFS clonefile copy of the base rootfs: instant, copy-on-write.
+	if _, err := os.Stat(rootfs); os.IsNotExist(err) {
+		if out, err := exec.Command("/bin/cp", "-Rc", rootfsBase, rootfs).CombinedOutput(); err != nil {
+			return "", "", fmt.Errorf("cloning rootfs: %v: %s", err, out)
+		}
+	}
+
+	// The guest boots into execd, which supervises the workload (on a pty
+	// when the pod asks for one) and serves exec/attach over vsock. Workload
+	// argv travels in a spec file: libkrun passes exec args via the kernel
+	// cmdline, which splits on whitespace, so it must go out-of-band.
+	if out, err := exec.Command("/bin/cp", "-c", a.execdPath, filepath.Join(rootfs, "execd")).CombinedOutput(); err != nil {
+		return "", "", fmt.Errorf("installing execd: %v: %s", err, out)
+	}
+	argv := append(append([]string{}, c.Command...), c.Args...)
+	if len(argv) == 0 {
+		argv = imageArgv(rootfsBase)
+	}
+	if len(argv) == 0 {
+		return "", "", fmt.Errorf("no command: pod spec has none and image config has no Entrypoint/Cmd")
+	}
+	specJSON, err := json.Marshal(map[string]any{"argv": argv, "tty": c.TTY})
+	if err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(filepath.Join(rootfs, ".podvm-spec.json"), specJSON, 0o644); err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(filepath.Join(rootfs, "entry.sh"), []byte("#!/bin/sh\nexec /execd\n"), 0o755); err != nil {
+		return "", "", err
+	}
+	return dir, rootfs, nil
 }
 
 func (a *agent) setPhase(ctx context.Context, pod *corev1.Pod, phase corev1.PodPhase, reason, message string, cs *corev1.ContainerStatus) {
@@ -479,7 +609,12 @@ func (a *agent) setPhase(ctx context.Context, pod *corev1.Pod, phase corev1.PodP
 	}
 	ready := corev1.ConditionFalse
 	if phase == corev1.PodRunning {
-		ready = corev1.ConditionTrue
+		a.mu.Lock()
+		vm := a.vms[pod.UID]
+		a.mu.Unlock()
+		if vm == nil || vm.getReady() {
+			ready = corev1.ConditionTrue
+		}
 	}
 	latest.Status.Conditions = []corev1.PodCondition{
 		{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: now},
