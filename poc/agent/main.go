@@ -396,7 +396,7 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 		a.setPhase(ctx, pod, corev1.PodFailed, reason, err.Error(), nil)
 	}
 
-	dir, rootfs, err := a.preparePod(pod)
+	dir, rootfsBase, err := a.preparePod(pod)
 	if err != nil {
 		fail("StartError", err)
 		return
@@ -413,6 +413,13 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 	}
 
 	for attempt := 0; ; attempt++ {
+		// Fresh container filesystem for every (re)start, matching kubelet
+		// semantics. The clone is an APFS clonefile copy, so this is cheap.
+		rootfs, err := a.makeRootfs(pod, dir, rootfsBase)
+		if err != nil {
+			fail("StartError", err)
+			return
+		}
 		logf, err := os.OpenFile(filepath.Join(dir, "container.log"),
 			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
@@ -541,9 +548,8 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 	}
 }
 
-// preparePod pulls the image and materializes the pod's rootfs. Note: the
-// rootfs is reused across container restarts (real kubelet gives restarted
-// containers a fresh filesystem).
+// preparePod does the once-per-pod work: pull the image, create the state
+// dir. Returns (stateDir, imageRootfsBase).
 func (a *agent) preparePod(pod *corev1.Pod) (string, string, error) {
 	if len(pod.Spec.Containers) == 0 {
 		return "", "", fmt.Errorf("no containers")
@@ -557,15 +563,30 @@ func (a *agent) preparePod(pod *corev1.Pod) (string, string, error) {
 	}
 
 	dir := filepath.Join(a.workDir, string(pod.UID))
-	rootfs := filepath.Join(dir, "rootfs")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", "", err
 	}
-	// APFS clonefile copy of the base rootfs: instant, copy-on-write.
-	if _, err := os.Stat(rootfs); os.IsNotExist(err) {
-		if out, err := exec.Command("/bin/cp", "-Rc", rootfsBase, rootfs).CombinedOutput(); err != nil {
-			return "", "", fmt.Errorf("cloning rootfs: %v: %s", err, out)
+	return dir, rootfsBase, nil
+}
+
+// makeRootfs materializes a fresh container filesystem from the image base,
+// discarding any previous one, and installs execd + the workload spec.
+func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string) (string, error) {
+	c := pod.Spec.Containers[0]
+	rootfs := filepath.Join(dir, "rootfs")
+
+	if _, err := os.Stat(rootfs); err == nil {
+		if err := os.RemoveAll(rootfs); err != nil {
+			// The guest may have created write-protected dirs; loosen and retry.
+			exec.Command("/bin/chmod", "-R", "u+rwX", rootfs).Run()
+			if err := os.RemoveAll(rootfs); err != nil {
+				return "", fmt.Errorf("removing previous rootfs: %w", err)
+			}
 		}
+	}
+	// APFS clonefile copy of the base rootfs: instant, copy-on-write.
+	if out, err := exec.Command("/bin/cp", "-Rc", rootfsBase, rootfs).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("cloning rootfs: %v: %s", err, out)
 	}
 
 	// The guest boots into execd, which supervises the workload (on a pty
@@ -573,26 +594,26 @@ func (a *agent) preparePod(pod *corev1.Pod) (string, string, error) {
 	// argv travels in a spec file: libkrun passes exec args via the kernel
 	// cmdline, which splits on whitespace, so it must go out-of-band.
 	if out, err := exec.Command("/bin/cp", "-c", a.execdPath, filepath.Join(rootfs, "execd")).CombinedOutput(); err != nil {
-		return "", "", fmt.Errorf("installing execd: %v: %s", err, out)
+		return "", fmt.Errorf("installing execd: %v: %s", err, out)
 	}
 	argv := append(append([]string{}, c.Command...), c.Args...)
 	if len(argv) == 0 {
 		argv = imageArgv(rootfsBase)
 	}
 	if len(argv) == 0 {
-		return "", "", fmt.Errorf("no command: pod spec has none and image config has no Entrypoint/Cmd")
+		return "", fmt.Errorf("no command: pod spec has none and image config has no Entrypoint/Cmd")
 	}
 	specJSON, err := json.Marshal(map[string]any{"argv": argv, "tty": c.TTY})
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	if err := os.WriteFile(filepath.Join(rootfs, ".podvm-spec.json"), specJSON, 0o644); err != nil {
-		return "", "", err
+		return "", err
 	}
 	if err := os.WriteFile(filepath.Join(rootfs, "entry.sh"), []byte("#!/bin/sh\nexec /execd\n"), 0o755); err != nil {
-		return "", "", err
+		return "", err
 	}
-	return dir, rootfs, nil
+	return rootfs, nil
 }
 
 func (a *agent) setPhase(ctx context.Context, pod *corev1.Pod, phase corev1.PodPhase, reason, message string, cs *corev1.ContainerStatus) {

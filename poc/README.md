@@ -106,10 +106,10 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
   pod's network view). Graceful termination delivers SIGTERM in the guest
   and escalates to SIGKILL after the grace period (host-side harness kill
   as backstop). restartPolicy is honored with a naive doubling crash
-  backoff; each restart is a fresh microVM but the pod rootfs is currently
-  reused across restarts (real kubelet gives restarted containers a fresh
-  filesystem). Named probe ports and lifecycle hooks (postStart/preStop)
-  are not implemented.
+  backoff; each restart is a fresh microVM with a fresh container
+  filesystem (re-cloned from the image base — APFS clonefile makes this
+  ~free), matching kubelet semantics. Named probe ports and lifecycle
+  hooks (postStart/preStop) are not implemented.
 - **In-guest supervision** is `execd` (poc/execd): a static Go daemon that
   libkrun's init execs; it runs the workload (on a pty when the pod sets
   `tty: true`), mirrors output to the console log, and serves exec/attach
