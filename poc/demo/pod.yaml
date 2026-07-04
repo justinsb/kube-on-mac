@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello-macos
+spec:
+  restartPolicy: Never
+  containers:
+    - name: hello
+      # Image is recorded but not pulled in the PoC: every pod runs the
+      # shared Alpine rootfs (APFS-cloned per pod).
+      image: alpine:3.22
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          echo "Hello from a Kubernetes pod in a microVM on macOS!"
+          uname -a
+          echo "This pod has been running for a bit..."
+          sleep 120
+      resources:
+        limits:
+          cpu: "1"
+          memory: 256Mi

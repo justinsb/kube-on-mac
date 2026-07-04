@@ -1,0 +1,4 @@
+_artifacts/
+harness/podvm
+harness/podvm.dSYM/
+agent/agent
