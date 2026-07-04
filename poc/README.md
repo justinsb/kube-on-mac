@@ -89,6 +89,15 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
   `_artifacts/images/`; pods get APFS clones. No layer store, no
   imagePullSecrets, anonymous registry auth only. Pods with no command use
   the image's Entrypoint/Cmd; image env vars/WorkingDir are not yet honored.
+- **Host filesystem semantics leak into guests** (verified empirically):
+  the rootfs is a virtiofs share of an APFS directory, so guests see APFS
+  case-insensitivity (`/Foo` and `/foo` are the same file) and host
+  ownership (image files appear as the host user's uid, and guest `chown`
+  is not faithful). Workloads that depend on case-sensitivity or strict
+  ownership (postgres data dirs, sshd strict modes) can misbehave. Fix
+  (future work): serve the image as a real Linux filesystem in a block
+  image (EROFS/ext4 lower + writable upper), keeping virtiofs for
+  configMap/secret-style shares and DAX.
 - **No pod networking**: no IPs, no services. TSI was deliberately disabled
   (it needs libkrunfw's patched kernel); the real design is routed IPv6 via
   virtio-net + guest-side service LB.
