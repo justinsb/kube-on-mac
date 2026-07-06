@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -47,6 +48,7 @@ type podVM struct {
 	ready    bool
 	stopping bool
 	restarts int32
+	ip6      string
 	stopOnce sync.Once
 }
 
@@ -60,6 +62,8 @@ func (vm *podVM) setReady(r bool) bool {
 	return changed
 }
 func (vm *podVM) getReady() bool   { vm.mu.Lock(); defer vm.mu.Unlock(); return vm.ready }
+func (vm *podVM) setIP(ip string)  { vm.mu.Lock(); vm.ip6 = ip; vm.mu.Unlock() }
+func (vm *podVM) getIP() string    { vm.mu.Lock(); defer vm.mu.Unlock(); return vm.ip6 }
 func (vm *podVM) setStopping()     { vm.mu.Lock(); vm.stopping = true; vm.mu.Unlock() }
 func (vm *podVM) isStopping() bool { vm.mu.Lock(); defer vm.mu.Unlock(); return vm.stopping }
 func (vm *podVM) restartCount() int32 {
@@ -119,6 +123,8 @@ type agent struct {
 	imagesDir   string
 	execdPath   string
 	gvproxyPath string
+	vmnetHelper string
+	podCIDR6    netip.Prefix
 	kubeletPort int
 
 	mu  sync.Mutex
@@ -135,6 +141,8 @@ func main() {
 		imagesDir     = flag.String("images-dir", "../_artifacts/images", "pulled-image rootfs cache")
 		execdPath     = flag.String("execd", "../_artifacts/execd", "path to the guest execd binary (linux/arm64)")
 		gvproxyPath   = flag.String("gvproxy", "../_artifacts/gvproxy", "path to gvproxy (outbound pod networking; empty to disable)")
+		vmnetHelper   = flag.String("vmnet-helper", "/opt/homebrew/opt/vmnet-helper/libexec/vmnet-helper", "path to vmnet-helper (routed IPv6 pod networking; empty to disable)")
+		podCIDR6      = flag.String("pod-cidr6", "fd42:6b75:6265::/64", "IPv6 ULA /64 for pod addresses")
 		assetsDir     = flag.String("assets", "", "envtest binary assets dir (kube-apiserver, etcd)")
 		kubeconfigOut = flag.String("kubeconfig-out", "../_artifacts/kubeconfig", "where to write admin kubeconfig")
 		kubeletPort   = flag.Int("kubelet-port", 10250, "port for the kubelet server (kubectl logs)")
@@ -193,11 +201,22 @@ func main() {
 		imagesDir:   *imagesDir,
 		execdPath:   *execdPath,
 		gvproxyPath: *gvproxyPath,
+		vmnetHelper: *vmnetHelper,
 		kubeletPort: *kubeletPort,
 		vms:         map[types.UID]*podVM{},
 	}
 	if err := os.MkdirAll(a.imagesDir, 0o755); err != nil {
 		log.Fatalf("creating images dir: %v", err)
+	}
+	if *vmnetHelper != "" {
+		prefix, err := netip.ParsePrefix(*podCIDR6)
+		if err != nil || prefix.Bits() != 64 || !prefix.Addr().Is6() {
+			log.Fatalf("--pod-cidr6 must be an IPv6 /64, got %q", *podCIDR6)
+		}
+		a.podCIDR6 = prefix
+		if _, err := os.Stat(*vmnetHelper); err != nil {
+			log.Fatalf("vmnet-helper not found at %s (brew install nirs/vmnet-helper/vmnet-helper, or --vmnet-helper='' to disable)", *vmnetHelper)
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -479,6 +498,36 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			}
 			harnessArgs = append(harnessArgs, "--net-socket", netSock)
 		}
+
+		// Per-pod vmnet-helper: guest eth1 on the shared vmnet L2, carrying
+		// the pod's routed IPv6 address.
+		var vmnetCmd *exec.Cmd
+		if a.vmnetHelper != "" {
+			vmSock := vmnetSockPath(pod.UID)
+			os.Remove(vmSock)
+			vc, mac, err := startVmnetHelper(a.vmnetHelper, pod.UID, vmSock,
+				filepath.Join(dir, "vmnet.log"))
+			if err != nil {
+				logf.Close()
+				if gvp != nil {
+					gvp.Process.Kill()
+				}
+				fail("StartError", err)
+				return
+			}
+			vmnetCmd = vc
+			if err := waitForSocket(vmSock, 5*time.Second); err != nil {
+				vmnetCmd.Process.Kill()
+				logf.Close()
+				if gvp != nil {
+					gvp.Process.Kill()
+				}
+				fail("StartError", err)
+				return
+			}
+			harnessArgs = append(harnessArgs, "--net2-socket", vmSock, "--net2-mac", mac)
+			vm.setIP(podIP6(a.podCIDR6, pod.UID).String())
+		}
 		harnessArgs = append(harnessArgs, "--", "/bin/sh", "/entry.sh")
 
 		cmd := exec.Command(a.harness, harnessArgs...)
@@ -488,6 +537,9 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			logf.Close()
 			if gvp != nil {
 				gvp.Process.Kill()
+			}
+			if vmnetCmd != nil {
+				vmnetCmd.Process.Kill()
 			}
 			fail("StartError", err)
 			return
@@ -518,6 +570,10 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 		if gvp != nil {
 			gvp.Process.Kill()
 			gvp.Wait()
+		}
+		if vmnetCmd != nil {
+			vmnetCmd.Process.Kill()
+			vmnetCmd.Wait()
 		}
 
 		exitCode := int32(0)
@@ -661,6 +717,11 @@ func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string) (string, err
 		return "", fmt.Errorf("no command: pod spec has none and image config has no Entrypoint/Cmd")
 	}
 	specData := map[string]any{"argv": argv, "tty": c.TTY}
+	if a.vmnetHelper != "" {
+		specData["net6"] = map[string]string{
+			"ip": podIP6(a.podCIDR6, pod.UID).String() + "/64",
+		}
+	}
 	if a.gvproxyPath != "" {
 		// gvproxy's virtual network: 192.168.127.0/24, gateway+DNS at .1.
 		// Per-pod gvproxy instance, so the guest address can be fixed.
@@ -696,13 +757,17 @@ func (a *agent) setPhase(ctx context.Context, pod *corev1.Pod, phase corev1.PodP
 		latest.Status.StartTime = &now
 	}
 	ready := corev1.ConditionFalse
+	a.mu.Lock()
+	vm := a.vms[pod.UID]
+	a.mu.Unlock()
 	if phase == corev1.PodRunning {
-		a.mu.Lock()
-		vm := a.vms[pod.UID]
-		a.mu.Unlock()
 		if vm == nil || vm.getReady() {
 			ready = corev1.ConditionTrue
 		}
+	}
+	if vm != nil && vm.getIP() != "" {
+		latest.Status.PodIP = vm.getIP()
+		latest.Status.PodIPs = []corev1.PodIP{{IP: vm.getIP()}}
 	}
 	latest.Status.Conditions = []corev1.PodCondition{
 		{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: now},

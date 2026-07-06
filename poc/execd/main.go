@@ -73,9 +73,34 @@ type request struct {
 }
 
 type spec struct {
-	Argv []string `json:"argv"`
-	TTY  bool     `json:"tty"`
-	Net  *netSpec `json:"net,omitempty"`
+	Argv []string  `json:"argv"`
+	TTY  bool      `json:"tty"`
+	Net  *netSpec  `json:"net,omitempty"`
+	Net6 *net6Spec `json:"net6,omitempty"`
+}
+
+type net6Spec struct {
+	IP string `json:"ip"` // CIDR, e.g. fd42:6b75:6265::42/64 (on eth1)
+}
+
+// configureNet6 puts the pod's routed IPv6 address on eth1 (the vmnet
+// interface). The /64 is on-link; no routes needed for v1.
+func configureNet6(ns *net6Spec) error {
+	eth1, err := netlink.LinkByName("eth1")
+	if err != nil {
+		return fmt.Errorf("no eth1: %w", err)
+	}
+	addr, err := netlink.ParseAddr(ns.IP)
+	if err != nil {
+		return fmt.Errorf("parsing ip %q: %w", ns.IP, err)
+	}
+	if err := netlink.AddrAdd(eth1, addr); err != nil {
+		return fmt.Errorf("adding address: %w", err)
+	}
+	if err := netlink.LinkSetUp(eth1); err != nil {
+		return fmt.Errorf("link up: %w", err)
+	}
+	return nil
 }
 
 type netSpec struct {
@@ -227,6 +252,13 @@ func main() {
 			log.Printf("configuring network: %v (continuing without)", err)
 		} else {
 			log.Printf("network up: %s via %s", sp.Net.IP, sp.Net.GW)
+		}
+	}
+	if sp.Net6 != nil {
+		if err := configureNet6(sp.Net6); err != nil {
+			log.Printf("configuring ipv6: %v (continuing without)", err)
+		} else {
+			log.Printf("ipv6 up: %s on eth1", sp.Net6.IP)
 		}
 	}
 

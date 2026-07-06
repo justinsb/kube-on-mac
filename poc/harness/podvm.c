@@ -51,6 +51,8 @@ int main(int argc, char *const argv[])
     const char *log_path = NULL;
     const char *vsock_exec_path = NULL;
     const char *net_socket_path = NULL;
+    const char *net2_socket_path = NULL;
+    const char *net2_mac = NULL;
     long cpus = 1;
     long mem_mib = 256;
     long dax_mib = 0;
@@ -64,12 +66,14 @@ int main(int argc, char *const argv[])
         { "log", required_argument, NULL, 'l' },
         { "vsock-exec", required_argument, NULL, 'x' },
         { "net-socket", required_argument, NULL, 'n' },
+        { "net2-socket", required_argument, NULL, 'N' },
+        { "net2-mac", required_argument, NULL, 'M' },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "+k:r:c:m:d:l:x:n:h", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "+k:r:c:m:d:l:x:n:N:M:h", opts, NULL)) != -1) {
         switch (c) {
         case 'k': kernel_path = optarg; break;
         case 'r': rootfs = optarg; break;
@@ -79,6 +83,8 @@ int main(int argc, char *const argv[])
         case 'l': log_path = optarg; break;
         case 'x': vsock_exec_path = optarg; break;
         case 'n': net_socket_path = optarg; break;
+        case 'N': net2_socket_path = optarg; break;
+        case 'M': net2_mac = optarg; break;
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 1;
         }
@@ -156,6 +162,27 @@ int main(int argc, char *const argv[])
         if (check(krun_add_net_unixgram(ctx, net_socket_path, -1, mac,
                                         COMPAT_NET_FEATURES, NET_FLAG_VFKIT),
                   "krun_add_net_unixgram"))
+            return 1;
+    }
+
+    /* Second NIC (guest eth1): vmnet via vmnet-helper — same unixgram
+     * protocol as gvproxy. The MAC is the vmnet-assigned one so the guest
+     * matches what the bridge expects. */
+    if (net2_socket_path != NULL) {
+        uint8_t mac2[6] = { 0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xef };
+        if (net2_mac != NULL &&
+            sscanf(net2_mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &mac2[0],
+                   &mac2[1], &mac2[2], &mac2[3], &mac2[4], &mac2[5]) != 6) {
+            fprintf(stderr, "bad --net2-mac %s\n", net2_mac);
+            return 1;
+        }
+        /* No offload features: vmnet-helper runs without checksum/TSO
+         * offload by default, so the guest must compute full checksums
+         * itself — otherwise TCP leaves the VM with partial checksums and
+         * the peer drops it (while ICMP, checksummed in software, works). */
+        if (check(krun_add_net_unixgram(ctx, net2_socket_path, -1, mac2,
+                                        0, NET_FLAG_VFKIT),
+                  "krun_add_net_unixgram (vmnet)"))
             return 1;
     }
 

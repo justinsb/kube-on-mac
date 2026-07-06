@@ -101,18 +101,21 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
   (future work): serve the image as a real Linux filesystem in a block
   image (EROFS/ext4 lower + writable upper), keeping virtiofs for
   configMap/secret-style shares and DAX.
-- **Outbound networking works; inbound/services don't yet.** Each pod VM
-  gets a virtio-net device backed by a per-pod gvproxy instance (userspace
-  NAT via gvisor netstack, vfkit unixgram protocol, no root needed); execd
-  configures the interface statically via netlink (192.168.127.2/24, gw+DNS
-  at .1) since images can't be assumed to ship iproute2. `apt-get update`
-  and `apt-get install` work from a debian pod. Explicitly interim: this is
-  userspace on the data path and every pod has the same private IP behind
-  its own NAT — no pod IPs in status, no pod-to-pod traffic, no services.
-  The real design (routed IPv6 via vmnet, guest-side service LB) replaces
-  it; the virtio-net guest plumbing built here carries over unchanged
-  (libkrun's unixgram backend takes vmnet-helper the same way it takes
-  gvproxy).
+- **Pod networking: routed IPv6 pod IPs are real; services aren't yet.**
+  Every pod VM has two NICs, both plumbed by execd via netlink (images
+  can't be assumed to ship iproute2):
+  - eth0 → per-pod gvproxy (userspace NAT): outbound IPv4 + DNS.
+    `apt-get update`/`install` work from a debian pod.
+  - eth1 → per-pod vmnet-helper on the macOS shared vmnet bridge
+    (rootless on macOS 26): each pod gets a stable IPv6 from a ULA /64
+    (derived from the pod UID), reported as the pod IP in status —
+    `kubectl get pods -o wide` shows real, distinct addresses, and
+    pod↔pod HTTP over IPv6 works (~0.4ms RTT). Bonus: macOS advertises a
+    NAT66 prefix on the bridge, so pods have outbound IPv6 too.
+  See research/vmnet.md for the architecture and the checksum-offload
+  trap. Still missing: Services/ClusterIP (next: guest-side LB per the
+  design doc), host→pod needs one sudo (`./host-net.sh`), cross-node
+  routing, and gvproxy→vmnet consolidation for IPv4.
 - **Partial kubelet server**: `kubectl logs` (with `-f`, `--tail`),
   `kubectl exec` (including `-it` with pty + resize + exit codes), and
   `kubectl attach` (so `kubectl run -it --image=debian:latest -- bash`
