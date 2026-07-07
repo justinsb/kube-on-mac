@@ -188,3 +188,39 @@ Shape for execd:
 Only-loose-end: a removed endpoint's id must not be reused until its
 conntrack entries are gone, or an in-flight mark could map to a new endpoint.
 Delay id reuse (or gate on a conntrack-empty check).
+
+## Spike: verdict-DNAT primitive — source verdict (does NFQA_CT carry NAT?)
+
+Question: can an NFQUEUE verdict carry `CTA_NAT_*` (nested in `NFQA_CT`) and
+have the kernel set up the DNAT, giving the one-rule/no-map north-star design?
+
+Read linux v6.12 `net/netfilter/nf_conntrack_netlink.c` +
+`nfnetlink_queue.c`. Path: verdict `NFQA_CT` → `nfqnl_ct_parse` →
+`nfnl_ct_hook->parse` = `ctnetlink_glue_parse` → `ctnetlink_glue_parse_ct`.
+
+`ctnetlink_glue_parse_ct` handles only: `CTA_TIMEOUT`, `CTA_STATUS`,
+`CTA_HELP`, `CTA_LABELS`, `CTA_MARK`. **No NAT.** `CTA_NAT_DST` on a verdict
+is parsed into `cda[]` and ignored.
+
+`ctnetlink_setup_nat()` (→ `ctnetlink_parse_nat_setup` → `nf_nat_setup_info`)
+is the helper we'd want; it's called only from the conntrack **create** path.
+`ctnetlink_change_conntrack()` deliberately rejects `CTA_NAT_*` with
+`-EOPNOTSUPP` ("only allow NAT changes … for new conntracks"). So the kernel
+enforces "NAT bound at creation, not retrofitted."
+
+Verdict: **doesn't work today; needs a kernel patch** — but a clean, small,
+principled one. On the NFQUEUE'd first packet the ct is new + unconfirmed
+(still "being created"), so calling `ctnetlink_setup_nat` there honors the
+invariant. Patch = ~6 lines in `ctnetlink_glue_parse_ct` guarded by
+`!nf_ct_is_confirmed(ct)`, reusing the existing helper (see services.md for
+the snippet). Upstreamable: "let a userspace NFQUEUE handler set up NAT on the
+flow it's steering" is generally useful, not a kube-on-macOS special.
+
+Second-order detail for when we build it: the manip lands on the ct, but the
+first packet still needs to traverse a nat hook post-verdict for
+`nf_nat_packet` to mangle it — queue placement / an implicit repeat needs
+care. Not a blocker, just design.
+
+Conclusion for now: the mark-based v2 (M1/M2/M3, proven, zero-userspace-code
+kernel) is what we build; the verdict-DNAT patch is the documented north star
+for a later kernel contribution.

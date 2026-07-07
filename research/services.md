@@ -234,12 +234,50 @@ kernel we control. And it is genuinely upstreamable: "let a userspace NFQUEUE
 handler perform NAT" is broadly useful (userspace LBs, custom NAT policy), not
 a kube-on-macOS hack.
 
-Open question / cheap spike: NFQUEUE verdicts can already carry conntrack
-attributes (`NFQA_CT`, used by userspace conntrack helpers). Whether
-`CTA_NAT_*` on that path routes through `nf_nat_setup_info` is untested — if
-yes, this needs **zero kernel changes**, just the right verdict attributes; if
-no, it's a focused patch (and we already build the kernel). Worth checking
-before building the mark+map machinery, since success moots it.
+### Spiked: does it work today? No — but the patch is ~6 lines.
+
+Read the 6.12 source. The NFQUEUE verdict's `NFQA_CT` attributes are parsed by
+`ctnetlink_glue_parse_ct()` (net/netfilter/nf_conntrack_netlink.c), which
+handles exactly `CTA_TIMEOUT`, `CTA_STATUS`, `CTA_HELP`, `CTA_LABELS`,
+`CTA_MARK` — and **nothing NAT**. A verdict carrying `CTA_NAT_DST` is parsed
+and silently ignored. So the primitive does not exist today; no userspace
+attribute-crafting reaches it.
+
+Deeper finding: NAT setup (`ctnetlink_setup_nat` → `nf_nat_setup_info`) is
+reachable only from conntrack **creation**. `ctnetlink_change_conntrack()`
+*explicitly* rejects `CTA_NAT_*` with `-EOPNOTSUPP` ("only allow NAT changes …
+for new conntracks"). It's a deliberate invariant: NAT is bound at ct
+creation, not retrofitted onto an existing entry.
+
+But that invariant *permits* our case cleanly: on the NFQUEUE'd first packet
+the ct is NEW and **unconfirmed** — still being created. So the principled
+patch is, in `ctnetlink_glue_parse_ct`:
+
+```c
+if (cda[CTA_NAT_DST] || cda[CTA_NAT_SRC]) {
+    if (nf_ct_is_confirmed(ct))      /* only at creation, honoring the invariant */
+        return -EOPNOTSUPP;
+    err = ctnetlink_setup_nat(ct, cda);   /* the existing, tested helper */
+    if (err < 0)
+        return err;
+}
+```
+
+~6 lines, reusing the existing helper, respecting the creation-time
+invariant (unconfirmed cts only). Second-order detail to work out when
+building it: ensuring the first packet actually gets mangled after the verdict
+given the hook it was queued from (the manip is on the ct; `nf_nat_packet`
+applies it on the next nat-hook traversal — may want to queue at/repeat
+through the right hook). Decisive spike outcome: **verdict-DNAT is a small,
+well-scoped, upstreamable kernel patch, not a userspace trick.** Details in
+[conntrack-spike.md](conntrack-spike.md).
+
+Corollary (nice property of where we already are — noted by the project
+owner): lazy pop-up + userspace steering compose with a **hot/cold tiering**
+optimization — cold services stay lazy (pop up per new flow), and any
+high-traffic VIP can be *materialized* into an old-style persistent nftables
+rule (numgen or the mark map) so it stops popping up at all. Best of both:
+laziness where flows are rare, zero-pop-up in-kernel where they're hot.
 
 Data-plane evolution summary:
 - v1 (shipped): persistent per-VIP numgen rule. Works; stale on endpoint
