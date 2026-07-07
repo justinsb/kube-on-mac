@@ -77,6 +77,11 @@ type spec struct {
 	TTY  bool      `json:"tty"`
 	Net  *netSpec  `json:"net,omitempty"`
 	Net6 *net6Spec `json:"net6,omitempty"`
+	Svc  *svcSpec  `json:"svc,omitempty"`
+}
+
+type svcSpec struct {
+	CIDR string `json:"cidr"` // ClusterIP range, e.g. fd42:6b75:6265:1::/112
 }
 
 type net6Spec struct {
@@ -260,6 +265,18 @@ func main() {
 		} else {
 			log.Printf("ipv6 up: %s on eth1", sp.Net6.IP)
 		}
+	}
+	if sp.Svc != nil {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("service LB panicked: %v (services unavailable, workload unaffected)", r)
+				}
+			}()
+			if err := setupServiceLB(sp.Svc.CIDR); err != nil {
+				log.Printf("service LB setup failed: %v (services unavailable)", err)
+			}
+		}()
 	}
 
 	wl := &workload{}

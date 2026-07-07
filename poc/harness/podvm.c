@@ -50,6 +50,7 @@ int main(int argc, char *const argv[])
     const char *rootfs = NULL;
     const char *log_path = NULL;
     const char *vsock_exec_path = NULL;
+    const char *vsock_svc_path = NULL;
     const char *net_socket_path = NULL;
     const char *net2_socket_path = NULL;
     const char *net2_mac = NULL;
@@ -65,6 +66,7 @@ int main(int argc, char *const argv[])
         { "dax-mb", required_argument, NULL, 'd' },
         { "log", required_argument, NULL, 'l' },
         { "vsock-exec", required_argument, NULL, 'x' },
+        { "vsock-svc", required_argument, NULL, 'S' },
         { "net-socket", required_argument, NULL, 'n' },
         { "net2-socket", required_argument, NULL, 'N' },
         { "net2-mac", required_argument, NULL, 'M' },
@@ -73,7 +75,7 @@ int main(int argc, char *const argv[])
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "+k:r:c:m:d:l:x:n:N:M:h", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "+k:r:c:m:d:l:x:S:n:N:M:h", opts, NULL)) != -1) {
         switch (c) {
         case 'k': kernel_path = optarg; break;
         case 'r': rootfs = optarg; break;
@@ -82,6 +84,7 @@ int main(int argc, char *const argv[])
         case 'd': dax_mib = atol(optarg); break;
         case 'l': log_path = optarg; break;
         case 'x': vsock_exec_path = optarg; break;
+        case 'S': vsock_svc_path = optarg; break;
         case 'n': net_socket_path = optarg; break;
         case 'N': net2_socket_path = optarg; break;
         case 'M': net2_mac = optarg; break;
@@ -192,6 +195,14 @@ int main(int argc, char *const argv[])
         unlink(vsock_exec_path);
         if (check(krun_add_vsock_port2(ctx, 1024, vsock_exec_path, true),
                   "krun_add_vsock_port2"))
+            return 1;
+    }
+
+    /* Guest-initiated channel (execd dials CID 2 port 1025): service
+     * endpoint queries land on the agent's unix socket. */
+    if (vsock_svc_path != NULL) {
+        if (check(krun_add_vsock_port(ctx, 1025, vsock_svc_path),
+                  "krun_add_vsock_port"))
             return 1;
     }
 

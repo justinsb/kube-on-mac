@@ -58,7 +58,10 @@ Prereqs: Xcode CLT, Homebrew (`rustup`, `llvm`, `lld`, `xz`), Go.
 2. Guest kernel: Kata Containers' prebuilt `vmlinux.container` (arm64 raw
    Image) from the kata-static release tarball → `_artifacts/vmlinux-arm64`.
    Its config already includes VIRTIO_FS, FUSE_DAX, FS_DAX, EROFS,
-   OVERLAY_FS, VIRTIO_PMEM, BPF — the whole roadmap in one kernel.
+   OVERLAY_FS, VIRTIO_PMEM, BPF. For **Services** you need nftables, which
+   the Kata kernel lacks: build a custom kernel (Kata 6.12.28 .config + the
+   NF_TABLES/NFT_* enable-delta) → `_artifacts/vmlinux-nft-arm64` and pass
+   `--kernel` to the agent. See research/services.md for the exact delta.
 3. Rootfs: Alpine minirootfs (aarch64) extracted to
    `_artifacts/rootfs-alpine`.
 4. `make -C harness` (compiles + codesigns; if the linker recorded
@@ -113,9 +116,19 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
     pod↔pod HTTP over IPv6 works (~0.4ms RTT). Bonus: macOS advertises a
     NAT66 prefix on the bridge, so pods have outbound IPv6 too.
   See research/vmnet.md for the architecture and the checksum-offload
-  trap. Still missing: Services/ClusterIP (next: guest-side LB per the
-  design doc), host→pod needs one sudo (`./host-net.sh`), cross-node
-  routing, and gvproxy→vmnet consolidation for IPv4.
+  trap. host→pod needs one sudo (`./host-net.sh`); cross-node routing and
+  gvproxy→vmnet IPv4 consolidation are future work.
+- **ClusterIP Services work, lazily.** IPv6 Services get a ClusterIP; the
+  first packet of a flow to one pops up from the guest kernel (NFQUEUE) to
+  execd, which asks the agent for endpoints over vsock, installs a
+  numgen-random DNAT nftables rule across the ready backend pods, and
+  reinjects. Every later flow to that VIP is load-balanced entirely
+  in-kernel (rule + conntrack) — userspace is touched once per (VIP,port),
+  not per connection. Requires a custom guest kernel with nftables (Kata
+  config + NFT delta; see research/services.md). Still v1: OUTPUT-hook /
+  pod-originated only (no NodePort), TTL invalidation (no endpoint-change
+  push, no conntrack flush on removal), random balancing (no
+  affinity/weights/topology), no named ports.
 - **Partial kubelet server**: `kubectl logs` (with `-f`, `--tail`),
   `kubectl exec` (including `-it` with pty + resize + exit codes), and
   `kubectl attach` (so `kubectl run -it --image=debian:latest -- bash`

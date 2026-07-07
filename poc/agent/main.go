@@ -125,6 +125,7 @@ type agent struct {
 	gvproxyPath string
 	vmnetHelper string
 	podCIDR6    netip.Prefix
+	svcCIDR6    string
 	kubeletPort int
 
 	mu  sync.Mutex
@@ -143,6 +144,8 @@ func main() {
 		gvproxyPath   = flag.String("gvproxy", "../_artifacts/gvproxy", "path to gvproxy (outbound pod networking; empty to disable)")
 		vmnetHelper   = flag.String("vmnet-helper", "/opt/homebrew/opt/vmnet-helper/libexec/vmnet-helper", "path to vmnet-helper (routed IPv6 pod networking; empty to disable)")
 		podCIDR6      = flag.String("pod-cidr6", "fd42:6b75:6265::/64", "IPv6 ULA /64 for pod addresses")
+		svcCIDR6      = flag.String("service-cidr6", "fd42:6b75:6265:1::/112", "IPv6 range for ClusterIPs")
+		svcCIDR4      = flag.String("service-cidr4", "10.96.0.0/16", "IPv4 service range (primary; keeps the apiserver's own kubernetes service happy)")
 		assetsDir     = flag.String("assets", "", "envtest binary assets dir (kube-apiserver, etcd)")
 		kubeconfigOut = flag.String("kubeconfig-out", "../_artifacts/kubeconfig", "where to write admin kubeconfig")
 		kubeletPort   = flag.Int("kubelet-port", 10250, "port for the kubelet server (kubectl logs)")
@@ -168,7 +171,13 @@ func main() {
 		// The apiserver prefers the node's Hostname address for kubelet
 		// connections (logs/exec); "macos-poc" doesn't resolve, so use the
 		// InternalIP we register (127.0.0.1).
-		Append("kubelet-preferred-address-types", "InternalIP")
+		Append("kubelet-preferred-address-types", "InternalIP").
+		// Dual-stack services: IPv4 primary (the apiserver's own kubernetes
+		// service and advertise address stay v4, which envtest sets up),
+		// IPv6 secondary for our pod-reachable ClusterIPs. Services request
+		// the v6 family explicitly (see demo). The apiserver allocates
+		// ClusterIPs itself — no controller-manager needed.
+		Append("service-cluster-ip-range", *svcCIDR4+","+*svcCIDR6)
 
 	log.Printf("starting kube-apiserver + etcd (envtest)...")
 	cfg, err := env.Start()
@@ -202,6 +211,7 @@ func main() {
 		execdPath:   *execdPath,
 		gvproxyPath: *gvproxyPath,
 		vmnetHelper: *vmnetHelper,
+		svcCIDR6:    *svcCIDR6,
 		kubeletPort: *kubeletPort,
 		vms:         map[types.UID]*podVM{},
 	}
@@ -527,6 +537,21 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			}
 			harnessArgs = append(harnessArgs, "--net2-socket", vmSock, "--net2-mac", mac)
 			vm.setIP(podIP6(a.podCIDR6, pod.UID).String())
+
+			// Lazy service resolution channel (guest dials out on cache
+			// miss); only meaningful with routed pod networking.
+			stopSvc, err := a.startSvcListener(ctx, pod.UID)
+			if err != nil {
+				vmnetCmd.Process.Kill()
+				logf.Close()
+				if gvp != nil {
+					gvp.Process.Kill()
+				}
+				fail("StartError", err)
+				return
+			}
+			defer stopSvc()
+			harnessArgs = append(harnessArgs, "--vsock-svc", svcSockPath(pod.UID))
 		}
 		harnessArgs = append(harnessArgs, "--", "/bin/sh", "/entry.sh")
 
@@ -721,6 +746,7 @@ func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string) (string, err
 		specData["net6"] = map[string]string{
 			"ip": podIP6(a.podCIDR6, pod.UID).String() + "/64",
 		}
+		specData["svc"] = map[string]string{"cidr": a.svcCIDR6}
 	}
 	if a.gvproxyPath != "" {
 		// gvproxy's virtual network: 192.168.127.0/24, gateway+DNS at .1.
