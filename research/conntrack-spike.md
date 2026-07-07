@@ -121,3 +121,70 @@ Open alternative not spiked: single persistent rule doing `dnat to
 verdict (userspace picks the backend, one rule, no per-flow churn). Keeps a
 small index->addr map that execd updates on endpoint change. Worth a spike if
 per-flow rule churn proves costly at scale.
+
+## Follow-up spike: mark-based single-rule design (no per-flow churn)
+
+Motivation: per-flow nft rule add/delete is the classic kube-proxy-iptables
+scaling wound (ruleset reloads O(rules)). The transient-rule design above
+still does 2 nft ops per new flow. Can we get to **zero nft ops per flow**?
+
+Idea: one static DNAT rule keyed on the packet mark; execd sets the mark on
+the NFQUEUE verdict (free — no netlink ruleset change); a mark->endpoint map
+translates in-kernel; the map changes only when *endpoints* change.
+
+```
+chain output type nat hook output priority dstnat {
+  ip6 daddr SVCCIDR meta mark != 0 dnat ip6 to meta mark map @eps  # re-traversal
+  ip6 daddr SVCCIDR meta mark 0     queue num 0                    # first packet
+}
+map eps { type mark : ipv6_addr . inet_service }  # {id -> addr:port}
+```
+
+Spiked on a two-pod path (mark-spike client, backend pod), UDP:
+
+- **M1 — static mark rule carries many flows, zero churn.** One rule
+  `meta mark 0x1 dnat to [backend]:7777`. Three flows (distinct source
+  ports) marked 0x1 via `SO_MARK`, one unmarked control. All three marked
+  flows delivered; the unmarked control was not DNAT'd. The rule was never
+  edited between flows.
+- **M2 — mark->endpoint map selects backends.** `dnat ip6 to meta mark map
+  @eps` with `{0x1: backend:7777, 0x2: backend:7778}`. Marked-1 flows landed
+  on 7777, marked-2 on 7778. Endpoint change = a `nft add/delete element`
+  (atomic set op, no ruleset reload), never a rule edit.
+- **M3 — the crux: does the NFQUEUE verdict mark survive NF_REPEAT?** Yes. A
+  tiny go-nfqueue daemon (`SetVerdictWithMark(id, NfRepeat, 1)`) marked each
+  first packet; the re-traversed packet matched `meta mark != 0` and was
+  DNAT'd via the map to the backend; conntrack recorded the manip. All three
+  nfqueue-driven flows delivered.
+  - Aside: only one process can bind a given queue number — the marktest
+    daemon EPERM'd on queue 0 because the pod's own execd already owns it for
+    the real service LB. Confirms the single-handler model; not a problem in
+    production (execd is that handler).
+
+### Verdict: this is the design to build
+
+Per-flow cost collapses to: one vsock query (cacheable in execd) + one
+`SetVerdictWithMark`. **Zero nftables operations per flow.** nft changes only
+on endpoint churn, at set-element granularity (atomic, no reload). And
+because execd picks the backend in userspace per flow, LB policy is arbitrary
+(round-robin / weighted / affinity) — strictly more flexible than the
+in-kernel `numgen random` the current PoC uses.
+
+Shape for execd:
+- Maintain an endpoint-id allocator: each live (addr,port) endpoint gets a
+  small stable int id; `eps` map holds `{id -> addr . port}`.
+- Base rules installed once at boot (the two above + the map).
+- On NFQUEUE pop-up: resolve/lookup endpoints (hot cache), pick one, ensure
+  its id/map-element exists, `SetVerdictWithMark(NfRepeat, id)`. No per-flow
+  nft op.
+- On endpoint change (host push): add/remove `eps` elements; flush conntrack
+  entries whose reply-src is a removed endpoint (established flows pinned to
+  it). Still the one unavoidable conntrack-flush step.
+- No connmark needed: only the first packet consults the mark; conntrack
+  carries the rest regardless. (Established packets never traverse the chain —
+  the nat hook applies the stored manip directly — so they never hit the
+  queue rule.)
+
+Only-loose-end: a removed endpoint's id must not be reused until its
+conntrack entries are gone, or an in-flight mark could map to a new endpoint.
+Delay id reuse (or gate on a conntrack-empty check).

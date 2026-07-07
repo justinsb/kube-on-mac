@@ -85,6 +85,19 @@ kernel so packets flow in-kernel, no persistent per-VIP rule." Findings:
   persistent-rule staleness — the model the project prefers. Endpoint removal
   still needs a conntrack flush for pinned established flows.
 
+  Caveat: this still does 2 nft ops per new flow — the kube-proxy-iptables
+  churn hotspot. Superseded by the mark-based design below.
+
+- **Mark-based single-rule design — zero nft ops per flow (recommended).**
+  One static rule DNATs by packet mark via a `mark -> endpoint` map; execd
+  sets the mark on the NFQUEUE verdict (`SetVerdictWithMark`, `NF_REPEAT`)
+  instead of touching the ruleset. The map changes only on endpoint churn, at
+  atomic set-element granularity. Per-flow cost = one vsock query + one mark
+  set, **no nftables operations**. execd picks the backend in userspace, so
+  LB policy is arbitrary (beats in-kernel `numgen`). Fully spiked (M1/M2/M3)
+  in [conntrack-spike.md](conntrack-spike.md) — this is the data plane to
+  build for v2.
+
 ## Control plane (host agent)
 
 - No kube-controller-manager runs in the PoC, so nothing writes
