@@ -206,6 +206,53 @@ per-flow churn and endpoint-change staleness. Keep `connect6` socket-LB as
 the v3 tier that removes the nft-map + conntrack-NAT duplication when node
 density or throughput demands it.
 
+## North star: an NFQUEUE verdict that establishes a DNAT
+
+The mark+map design and the eBPF connect-LB both work around a capability the
+kernel doesn't quite expose: letting a userspace NFQUEUE handler *steer a
+flow* by returning the target, with the kernel setting up the reversible NAT.
+
+The ideal primitive: on the NFQUEUE'd first packet (which already carries an
+unconfirmed conntrack), userspace returns a verdict carrying the full DNAT
+target `addr:port`; the kernel calls `nf_nat_setup_info(ct, target,
+NF_NAT_MANIP_DST)` in the verdict path, then accepts. Consequences:
+
+- **One rule:** `ip6 daddr SVCCIDR ct state new queue num 0`. No second rule,
+  no mark, no `eps` map, no token→address translation (the verdict carries
+  the 128-bit address directly).
+- **Zero per-flow nft ops**, and no per-endpoint map to maintain.
+- **UDP handled identically to TCP** — conntrack tracks the pseudo-flow and
+  reverses replies; no `sendmsg6`/`recvmsg6` reverse-translation as eBPF
+  socket-LB needs for unconnected UDP (a real, recurring Cilium pain point).
+- **Decision fully in userspace, per flow** — execd can steer on arbitrary
+  state (external health, app attributes, canary/fault injection, tracing)
+  that can't live in a BPF map consulted at connect() time.
+
+This is the turn-1 "userspace decides the first packet, kernel steers the
+rest" ideal, realized cleanly — possible only because pods run a guest Linux
+kernel we control. And it is genuinely upstreamable: "let a userspace NFQUEUE
+handler perform NAT" is broadly useful (userspace LBs, custom NAT policy), not
+a kube-on-macOS hack.
+
+Open question / cheap spike: NFQUEUE verdicts can already carry conntrack
+attributes (`NFQA_CT`, used by userspace conntrack helpers). Whether
+`CTA_NAT_*` on that path routes through `nf_nat_setup_info` is untested — if
+yes, this needs **zero kernel changes**, just the right verdict attributes; if
+no, it's a focused patch (and we already build the kernel). Worth checking
+before building the mark+map machinery, since success moots it.
+
+Data-plane evolution summary:
+- v1 (shipped): persistent per-VIP numgen rule. Works; stale on endpoint
+  change; no per-flow churn but in-kernel-only LB decision.
+- v2 (proven, mark-based): one static rule + `mark->endpoint` map; execd marks
+  the verdict. Zero per-flow nft ops; userspace LB decision; endpoint change =
+  atomic set-element update + conntrack flush.
+- v-next (north star): NFQUEUE verdict establishes the DNAT directly. One
+  rule, no map, UDP-uniform, fully userspace-steered. Kernel primitive
+  (possibly free via NFQA_CT; else a small upstreamable patch).
+- v3 (throughput/density tier): eBPF `cgroup/connect6` socket-LB. No NAT, no
+  conntrack state; map-driven at connect time (not pop-up); weaker UDP story.
+
 ## Deliberate v1 simplifications
 
 - OUTPUT-hook only (pod-originated traffic). Hostports/NodePort ingress are
