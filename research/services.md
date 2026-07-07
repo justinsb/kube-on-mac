@@ -62,6 +62,29 @@ adds host-pushed invalidation over the existing host→guest channel when
 endpoints change. A removed endpoint additionally needs conntrack entries
 flushed (CTNETLINK) so established flows don't keep hitting it.
 
+**Known gap in the as-built code (see the endpoint-change note below):** the
+persistent per-VIP DNAT rule is inserted *above* the queue rule and has no
+`ct state new` guard, so once installed it shadows the queue rule — no packet
+re-queues, the TTL never triggers a refresh, and there is no rule-expiry
+timer. Net effect today: endpoint changes are not reflected until the pod VM
+restarts. Fixing this is the next services increment; the preferred direction
+(per-flow userspace decision instead of a persistent rule) is validated in
+[conntrack-spike.md](conntrack-spike.md).
+
+### Direction for the redesign (spiked, see conntrack-spike.md)
+
+We explored "make the routing decision in userspace per new flow, program the
+kernel so packets flow in-kernel, no persistent per-VIP rule." Findings:
+
+- **Directly injecting a NAT'd conntrack entry via ctnetlink does NOT drive
+  DNAT** — the manip is only set up by a packet traversing a real nat rule.
+- **A transient per-flow (5-tuple) DNAT rule does the job**: install on the
+  NFQUEUE pop-up, `NF_REPEAT`, then delete once conntrack holds the flow
+  (verified: the flow keeps working after the rule is gone). This gives
+  per-flow userspace decisions with an in-kernel per-packet path and no
+  persistent-rule staleness — the model the project prefers. Endpoint removal
+  still needs a conntrack flush for pinned established flows.
+
 ## Control plane (host agent)
 
 - No kube-controller-manager runs in the PoC, so nothing writes
