@@ -161,6 +161,51 @@ Findings that bit us:
   IPv4). Run dual-stack v4-primary + v6-secondary; Services request the v6
   family (`ipFamilies: [IPv6]`) to get pod-reachable ClusterIPs.
 
+## Efficiency ceiling of the mark design, and the eBPF path (v3)
+
+The mark-based design still expresses the target address in two places: the
+nftables `eps` map (per endpoint) and conntrack (per flow). That's not the
+mark stored twice — the map is per-endpoint token→address translation, needed
+only because a 32-bit mark can't carry a 128-bit address+port; conntrack is
+the per-flow runtime state. The map is cheap (atomic set ops on endpoint
+churn, not per flow), but it *is* a translation layer we maintain rather than
+something fundamental.
+
+Why we can't just steer the packet in userspace and skip all of it: rewriting
+the destination in the NFQUEUE handler without going through `nf_nat` means
+conntrack never records a NAT, so reply traffic from the backend is never
+rewritten back to the VIP and the client drops it (spike E1d showed the
+established-flow half of exactly this). The mark→map→`dnat` path exists solely
+to route the userspace decision *through* `nf_nat` so conntrack sets up a
+reversible bidirectional manip.
+
+The mechanism that removes the duplication entirely is **eBPF socket-LB
+(`cgroup/connect6`, + `sendmsg6`/`recvmsg6` for unconnected UDP)** — the
+Cilium model. It rewrites the destination sockaddr at `connect()` time, once
+per connection, in process context, before any packet exists. The socket then
+talks straight to the backend: no NAT, no conntrack NAT entry, no per-packet
+cost, and the endpoint set lives in one BPF map (no conntrack duplication).
+Viable on our kernel (`CONFIG_CGROUP_BPF=y`, `CONFIG_BPF_SYSCALL=y`; we build
+the kernel, so BTF/CO-RE is ours to enable). execd fits it directly — it's
+already the guest agent; it would manage a BPF map instead of nft rules.
+
+Not a custom kernel module: eBPF gives the same power without out-of-tree
+maintenance, and `connect6` is a near-exact fit. A module would only be
+justified by a gap eBPF can't fill; there isn't one here.
+
+The trade, and why it's not the default yet: `connect6` makes the decision
+**map-driven at connect time**, not pop-up-per-flow — you can't cleanly block
+a `connect()` on a userspace round-trip, so the BPF program picks from a
+userspace-maintained map (round-robin/affinity/weighted in BPF) rather than
+execd deciding each flow. For services that's almost always sufficient (the
+per-flow choice is just "pick from the current set"). It's the same
+"better than your ideal" trade noted at the top of the services table.
+
+Plan: ship the mark-based nftables data plane (proven M1/M2/M3), which fixes
+per-flow churn and endpoint-change staleness. Keep `connect6` socket-LB as
+the v3 tier that removes the nft-map + conntrack-NAT duplication when node
+density or throughput demands it.
+
 ## Deliberate v1 simplifications
 
 - OUTPUT-hook only (pod-originated traffic). Hostports/NodePort ingress are
