@@ -118,17 +118,23 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
   See research/vmnet.md for the architecture and the checksum-offload
   trap. host→pod needs one sudo (`./host-net.sh`); cross-node routing and
   gvproxy→vmnet IPv4 consolidation are future work.
-- **ClusterIP Services work, lazily.** IPv6 Services get a ClusterIP; the
-  first packet of a flow to one pops up from the guest kernel (NFQUEUE) to
-  execd, which asks the agent for endpoints over vsock, installs a
-  numgen-random DNAT nftables rule across the ready backend pods, and
-  reinjects. Every later flow to that VIP is load-balanced entirely
-  in-kernel (rule + conntrack) — userspace is touched once per (VIP,port),
-  not per connection. Requires a custom guest kernel with nftables (Kata
-  config + NFT delta; see research/services.md). Still v1: OUTPUT-hook /
-  pod-originated only (no NodePort), TTL invalidation (no endpoint-change
-  push, no conntrack flush on removal), random balancing (no
-  affinity/weights/topology), no named ports.
+- **ClusterIP Services work, lazily, with zero per-flow nftables churn.**
+  IPv6 Services get a ClusterIP; the first packet of a new flow pops up from
+  the guest kernel (NFQUEUE) to execd, which resolves endpoints from the
+  agent (cached), picks a backend **in userspace** (round-robin), and sets a
+  packet **mark** on the verdict. One static rule DNATs by mark through a
+  `mark → addr:port` map; the map changes only when endpoints change, never
+  per flow. Every later packet is handled in-kernel by conntrack. Verified:
+  8 requests split 4/4 across two backends with a single "LB active" log line
+  and no per-flow rule ops; deleting a backend moved all new flows to the
+  survivor within the cache TTL (no pod restart — the old numgen-rule design
+  went stale until restart). Requires a custom guest kernel with nftables
+  (Kata config + NFT delta; see research/services.md for the mark design and
+  the north-star verdict-DNAT kernel primitive). Still v2: OUTPUT-hook /
+  pod-originated only (no NodePort); endpoint-removal conntrack flush is
+  best-effort (shells out to `conntrack`, absent from most images) so
+  long-lived flows to a removed backend aren't force-reset; no
+  affinity/weights/topology; no named ports.
 - **Partial kubelet server**: `kubectl logs` (with `-f`, `--tail`),
   `kubectl exec` (including `-it` with pty + resize + exit codes), and
   `kubectl attach` (so `kubectl run -it --image=debian:latest -- bash`

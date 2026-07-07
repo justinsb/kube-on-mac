@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -18,17 +19,26 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Lazy ClusterIP load balancing (see research/services.md). At boot we
-// install one nftables rule: new connections to the service CIDR are queued
-// to userspace (here). On the first packet of a flow to an unseen VIP we ask
-// the host agent for endpoints, install a per-VIP DNAT rule ahead of the
-// queue rule, and NF_REPEAT the packet so it re-traverses and gets DNAT'd.
-// Every later flow to that VIP is handled entirely in-kernel.
+// Mark-based lazy ClusterIP load balancing (see research/services.md, the v2
+// data plane). At boot we install ONE static rule set:
+//
+//	ip6 daddr <SVCCIDR> meta mark != 0 dnat ip6 to meta mark map @eps  # re-traversal
+//	ip6 daddr <SVCCIDR> meta mark 0    queue num 0                     # first packet
+//	map eps { type mark : ipv6_addr . inet_service }                  # id -> addr:port
+//
+// The first packet of a new flow (mark 0) pops up here; we resolve endpoints
+// (host agent over vsock, cached), pick one in userspace, ensure it has an
+// id + eps map element, and NF_REPEAT the packet with that mark set on the
+// verdict. The re-traversed packet matches `meta mark != 0`, is DNAT'd via
+// the map, and conntrack carries the rest of the flow in-kernel. No per-flow
+// nftables operations: the map changes only when endpoints change.
 
 const (
 	svcVsockPort = 1025
 	nfQueueNum   = 0
 	svcTable     = "kube"
+	epsMapName   = "eps"
+	cacheTTL     = 10 * time.Second
 )
 
 type svcQuery struct {
@@ -44,18 +54,31 @@ type svcAnswer struct {
 	Error      string   `json:"error,omitempty"`
 }
 
+type endpoint struct {
+	addr string
+	port int
+}
+
+type svcCacheEntry struct {
+	endpoints []endpoint
+	expiry    time.Time
+	rr        int // round-robin cursor
+}
+
 type svcLB struct {
-	cidr    *net.IPNet
-	nft     *nftables.Conn
-	table   *nftables.Table
-	chain   *nftables.Chain
-	queue   *nftables.Rule // the fallthrough queue rule (VIP rules go above it)
+	cidr  *net.IPNet
+	nft   *nftables.Conn
+	table *nftables.Table
+	chain *nftables.Chain
+	eps   *nftables.Set // map: mark -> addr:port
+
 	mu      sync.Mutex
-	known   map[string]time.Time // "vip:port:proto" -> expiry
+	epID    map[endpoint]uint32 // endpoint -> mark id (>=1)
+	nextID  uint32
+	cache   map[string]*svcCacheEntry // "vip:port:proto" -> endpoints
 	queryFn func(svcQuery) (svcAnswer, error)
 }
 
-// setupServiceLB installs the base nft table and starts the NFQUEUE reader.
 func setupServiceLB(cidr string) error {
 	_, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil {
@@ -64,7 +87,9 @@ func setupServiceLB(cidr string) error {
 	lb := &svcLB{
 		cidr:    ipnet,
 		nft:     &nftables.Conn{},
-		known:   map[string]time.Time{},
+		epID:    map[endpoint]uint32{},
+		nextID:  1, // 0 is reserved (unmarked = pop up)
+		cache:   map[string]*svcCacheEntry{},
 		queryFn: querySvcOverVsock,
 	}
 	if err := lb.installBase(); err != nil {
@@ -85,6 +110,18 @@ func setupServiceLB(cidr string) error {
 
 func (lb *svcLB) installBase() error {
 	lb.table = lb.nft.AddTable(&nftables.Table{Family: nftables.TableFamilyIPv6, Name: svcTable})
+	// map eps: mark -> (ipv6_addr . inet_service). Concatenation is false —
+	// that flag is for concatenated KEYS; here only the DATA is a concat.
+	lb.eps = &nftables.Set{
+		Table:    lb.table,
+		Name:     epsMapName,
+		IsMap:    true,
+		KeyType:  nftables.TypeMark,
+		DataType: nftables.MustConcatSetType(nftables.TypeIP6Addr, nftables.TypeInetService),
+	}
+	if err := lb.nft.AddSet(lb.eps, nil); err != nil {
+		return fmt.Errorf("add eps map: %w", err)
+	}
 	lb.chain = lb.nft.AddChain(&nftables.Chain{
 		Name:     "output",
 		Table:    lb.table,
@@ -92,38 +129,130 @@ func (lb *svcLB) installBase() error {
 		Hooknum:  nftables.ChainHookOutput,
 		Priority: nftables.ChainPriorityNATDest,
 	})
-	// ip6 daddr <cidr> ct state new  queue num 0
-	lb.queue = lb.nft.AddRule(&nftables.Rule{
-		Table: lb.table,
-		Chain: lb.chain,
-		Exprs: []expr.Any{
-			&expr.Payload{ // ip6 daddr (offset 24, len 16)
-				DestRegister: 1, Base: expr.PayloadBaseNetworkHeader,
-				Offset: 24, Len: 16,
-			},
-			&expr.Bitwise{
-				SourceRegister: 1, DestRegister: 1, Len: 16,
-				Mask: lb.cidr.Mask, Xor: make([]byte, 16),
-			},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: lb.cidr.IP.To16()},
-			&expr.Ct{Register: 1, Key: expr.CtKeySTATE},
-			&expr.Bitwise{
-				SourceRegister: 1, DestRegister: 1, Len: 4,
-				Mask: binaryLE(nfCtStateNew), Xor: []byte{0, 0, 0, 0},
-			},
+	// rule 1: ip6 daddr <cidr> meta mark != 0 dnat ip6 to meta mark map @eps
+	lb.nft.AddRule(&nftables.Rule{
+		Table: lb.table, Chain: lb.chain,
+		Exprs: append(lb.matchCIDR(),
+			&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
 			&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte{0, 0, 0, 0}},
+			&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
+			&expr.Lookup{SourceRegister: 1, DestRegister: 1, IsDestRegSet: true, SetName: lb.eps.Name, SetID: lb.eps.ID},
+			&expr.NAT{Type: expr.NATTypeDestNAT, Family: unix.NFPROTO_IPV6, RegAddrMin: 1, RegProtoMin: 2},
+		),
+	})
+	// rule 2: ip6 daddr <cidr> meta mark 0 queue num 0
+	lb.nft.AddRule(&nftables.Rule{
+		Table: lb.table, Chain: lb.chain,
+		Exprs: append(lb.matchCIDR(),
+			&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0, 0, 0, 0}},
 			&expr.Queue{Num: nfQueueNum},
-		},
+		),
 	})
 	return lb.nft.Flush()
 }
 
-const nfCtStateNew = 0x08 // IP_CT_NEW bit in ct state bitmask
+func (lb *svcLB) matchCIDR() []expr.Any {
+	return []expr.Any{
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 24, Len: 16},
+		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 16, Mask: lb.cidr.Mask, Xor: make([]byte, 16)},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: lb.cidr.IP.To16()},
+	}
+}
 
-func binaryLE(v uint32) []byte {
+func markKey(id uint32) []byte {
 	b := make([]byte, 4)
-	binary.LittleEndian.PutUint32(b, v)
+	binary.LittleEndian.PutUint32(b, id) // native order to match `meta mark`
 	return b
+}
+
+// idFor returns the mark id for an endpoint, allocating one and adding the
+// eps map element on first use. Caller holds lb.mu.
+func (lb *svcLB) idFor(ep endpoint) (uint32, error) {
+	if id, ok := lb.epID[ep]; ok {
+		return id, nil
+	}
+	id := lb.nextID
+	lb.nextID++
+	// map value = addr(16) + port(2, big-endian) + pad(2) to a 4-byte boundary
+	val := append(net.ParseIP(ep.addr).To16(), byte(ep.port>>8), byte(ep.port), 0, 0)
+	if err := lb.nft.SetAddElements(lb.eps, []nftables.SetElement{{Key: markKey(id), Val: val}}); err != nil {
+		return 0, err
+	}
+	if err := lb.nft.Flush(); err != nil {
+		return 0, err
+	}
+	lb.epID[ep] = id
+	return id, nil
+}
+
+// pick resolves the service (cached) and returns the mark for the chosen
+// backend, round-robin. Returns 0 if there are no endpoints.
+func (lb *svcLB) pick(vip string, port int, proto string) (uint32, error) {
+	key := fmt.Sprintf("%s:%d:%s", vip, port, proto)
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	ent := lb.cache[key]
+	if ent == nil || time.Now().After(ent.expiry) {
+		ans, err := lb.queryFn(svcQuery{VIP: vip, Port: port, Proto: proto})
+		if err != nil {
+			return 0, err
+		}
+		if ans.Error != "" {
+			return 0, fmt.Errorf("%s", ans.Error)
+		}
+		newEps := make([]endpoint, len(ans.Endpoints))
+		for i, a := range ans.Endpoints {
+			newEps[i] = endpoint{addr: a, port: ans.TargetPort}
+		}
+		lb.reconcileEndpoints(ent, newEps)
+		rr := 0
+		if ent != nil {
+			rr = ent.rr
+		}
+		ttl := time.Duration(ans.TTLSeconds) * time.Second
+		if ttl <= 0 {
+			ttl = cacheTTL
+		}
+		ent = &svcCacheEntry{endpoints: newEps, expiry: time.Now().Add(ttl), rr: rr}
+		lb.cache[key] = ent
+	}
+	if len(ent.endpoints) == 0 {
+		return 0, nil
+	}
+	ep := ent.endpoints[ent.rr%len(ent.endpoints)]
+	ent.rr++
+	return lb.idFor(ep)
+}
+
+// reconcileEndpoints flushes conntrack entries for endpoints that were in the
+// previous set but are gone now, so established flows pinned to a removed
+// backend reset. Caller holds lb.mu.
+func (lb *svcLB) reconcileEndpoints(old *svcCacheEntry, newEps []endpoint) {
+	if old == nil {
+		return
+	}
+	nowSet := map[endpoint]bool{}
+	for _, e := range newEps {
+		nowSet[e] = true
+	}
+	for _, e := range old.endpoints {
+		if !nowSet[e] {
+			flushConntrackTo(e.addr)
+			// Keep the eps element/id: harmless (never selected again) and
+			// reusing an id before its conntrack drains could misroute an
+			// in-flight mark. A real impl would GC ids after a drain check.
+		}
+	}
+}
+
+// flushConntrackTo deletes conntrack entries whose reply source is addr
+// (i.e. flows currently DNAT'd to that removed backend).
+func flushConntrackTo(addr string) {
+	// execd ships no conntrack lib; shell out is fine for the rare removal
+	// path. Best-effort.
+	_ = exec.Command("conntrack", "-D", "--reply-src", addr).Run()
 }
 
 func (lb *svcLB) serve(nf *nfqueue.Nfqueue) error {
@@ -137,39 +266,20 @@ func (lb *svcLB) serve(nf *nfqueue.Nfqueue) error {
 			nf.SetVerdict(id, nfqueue.NfDrop)
 			return 0
 		}
-		key := fmt.Sprintf("%s:%d:%s", vip, port, proto)
-
-		lb.mu.Lock()
-		exp, seen := lb.known[key]
-		fresh := seen && time.Now().Before(exp)
-		lb.mu.Unlock()
-
-		if fresh {
-			// Rule already present (race: packet queued before rule took
-			// effect). Re-traverse.
-			nf.SetVerdict(id, nfqueue.NfRepeat)
-			return 0
-		}
-
-		ans, err := lb.queryFn(svcQuery{VIP: vip, Port: port, Proto: proto})
-		if err != nil || ans.Error != "" || len(ans.Endpoints) == 0 {
-			log.Printf("svc %s: no endpoints (%v/%s); dropping", key, err, ans.Error)
-			// Short negative cache via reject rule would go here; for now drop.
+		mark, err := lb.pick(vip, port, proto)
+		if err != nil || mark == 0 {
+			if err != nil {
+				log.Printf("svc %s:%d/%s: %v; dropping", vip, port, proto, err)
+			} else {
+				log.Printf("svc %s:%d/%s: no endpoints; dropping", vip, port, proto)
+			}
 			nf.SetVerdict(id, nfqueue.NfDrop)
 			return 0
 		}
-		if err := lb.installVIP(vip, port, proto, ans); err != nil {
-			log.Printf("svc %s: installing rule: %v", key, err)
-			nf.SetVerdict(id, nfqueue.NfDrop)
-			return 0
+		// Set the mark and re-traverse: the packet now hits the DNAT rule.
+		if err := nf.SetVerdictWithMark(id, nfqueue.NfRepeat, int(mark)); err != nil {
+			log.Printf("svc %s:%d/%s: verdict: %v", vip, port, proto, err)
 		}
-		lb.mu.Lock()
-		lb.known[key] = time.Now().Add(time.Duration(ans.TTLSeconds) * time.Second)
-		lb.mu.Unlock()
-		log.Printf("svc %s: installed DNAT -> %v:%d", key, ans.Endpoints, ans.TargetPort)
-
-		// Re-traverse: now hits the DNAT rule we just inserted.
-		nf.SetVerdict(id, nfqueue.NfRepeat)
 		return 0
 	}
 	errFn := func(e error) int {
@@ -179,96 +289,17 @@ func (lb *svcLB) serve(nf *nfqueue.Nfqueue) error {
 	if err := nf.RegisterWithErrorFunc(context.Background(), fn, errFn); err != nil {
 		return fmt.Errorf("registering nfqueue handler: %w", err)
 	}
-	log.Printf("service LB active: queuing new flows to %s", lb.cidr)
-	select {} // block forever; the nfqueue runs in its own goroutines
-}
-
-// installVIP inserts, ahead of the queue rule:
-//
-//	ip6 daddr VIP <proto> dport PORT dnat to numgen random mod N map { … }
-func (lb *svcLB) installVIP(vip string, port int, proto string, ans svcAnswer) error {
-	l4proto := byte(unix.IPPROTO_TCP)
-	dportOff := 2 // TCP/UDP dest port at offset 2 in the transport header
-	if proto == "udp" {
-		l4proto = byte(unix.IPPROTO_UDP)
-	}
-
-	// Match: ip6 daddr VIP && l4proto && dport PORT
-	matchExprs := []expr.Any{
-		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 24, Len: 16},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: net.ParseIP(vip).To16()},
-		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{l4proto}},
-		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: uint32(dportOff), Len: 2},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binary.BigEndian.AppendUint16(nil, uint16(port))},
-	}
-
-	// Load-balance target selection. With one endpoint, a plain immediate;
-	// with several, numgen random mod N indexes an anonymous verdict map
-	// index->address so subsequent flows balance entirely in-kernel.
-	var lbExprs []expr.Any
-	if len(ans.Endpoints) == 1 {
-		lbExprs = []expr.Any{
-			&expr.Immediate{Register: 1, Data: net.ParseIP(ans.Endpoints[0]).To16()},
-		}
-	} else {
-		setElems := make([]nftables.SetElement, len(ans.Endpoints))
-		for i, ep := range ans.Endpoints {
-			setElems[i] = nftables.SetElement{
-				Key: binaryLE(uint32(i)),
-				Val: net.ParseIP(ep).To16(),
-			}
-		}
-		m := &nftables.Set{
-			Table:     lb.table,
-			Anonymous: true,
-			Constant:  true,
-			IsMap:     true,
-			KeyType:   nftables.TypeInteger,
-			DataType:  nftables.TypeIP6Addr,
-		}
-		if err := lb.nft.AddSet(m, setElems); err != nil {
-			return fmt.Errorf("addset: %w", err)
-		}
-		lbExprs = []expr.Any{
-			&expr.Numgen{Register: 1, Modulus: uint32(len(ans.Endpoints)), Type: unix.NFT_NG_RANDOM},
-			// IsDestRegSet marks this as a data-map lookup (numgen index ->
-			// endpoint address). Omitting it produces malformed bytecode
-			// that the kernel rejects with EINVAL.
-			&expr.Lookup{SourceRegister: 1, DestRegister: 1, IsDestRegSet: true, SetName: m.Name, SetID: m.ID},
-		}
-	}
-
-	// dnat to reg1 : reg2(port)
-	natExprs := []expr.Any{
-		&expr.Immediate{Register: 2, Data: binary.BigEndian.AppendUint16(nil, uint16(ans.TargetPort))},
-		&expr.NAT{
-			Type:        expr.NATTypeDestNAT,
-			Family:      unix.NFPROTO_IPV6,
-			RegAddrMin:  1,
-			RegProtoMin: 2,
-		},
-	}
-
-	exprs := append(append(matchExprs, lbExprs...), natExprs...)
-	lb.nft.InsertRule(&nftables.Rule{ // Insert = prepend, above the queue rule
-		Table: lb.table,
-		Chain: lb.chain,
-		Exprs: exprs,
-	})
-	return lb.nft.Flush()
+	log.Printf("service LB active (mark-based): queuing new flows to %s", lb.cidr)
+	select {}
 }
 
 // parseFlow extracts (dst ip6, dst port, proto) from an IPv6 packet with a
-// TCP or UDP header directly after the fixed header (no extension headers,
-// which our own traffic won't have).
+// TCP or UDP header directly after the fixed header.
 func parseFlow(pkt []byte) (vip string, port int, proto string, ok bool) {
-	if len(pkt) < 40 || pkt[0]>>4 != 6 {
+	if len(pkt) < 44 || pkt[0]>>4 != 6 {
 		return "", 0, "", false
 	}
-	nextHdr := pkt[6]
-	dst := net.IP(pkt[24:40])
-	switch nextHdr {
+	switch pkt[6] {
 	case unix.IPPROTO_TCP:
 		proto = "tcp"
 	case unix.IPPROTO_UDP:
@@ -276,10 +307,8 @@ func parseFlow(pkt []byte) (vip string, port int, proto string, ok bool) {
 	default:
 		return "", 0, "", false
 	}
-	if len(pkt) < 44 {
-		return "", 0, "", false
-	}
-	port = int(binary.BigEndian.Uint16(pkt[42:44])) // dport at offset 2 of L4
+	dst := net.IP(pkt[24:40])
+	port = int(binary.BigEndian.Uint16(pkt[42:44]))
 	return dst.String(), port, proto, true
 }
 

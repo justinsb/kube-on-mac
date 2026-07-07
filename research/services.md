@@ -280,11 +280,18 @@ rule (numgen or the mark map) so it stops popping up at all. Best of both:
 laziness where flows are rare, zero-pop-up in-kernel where they're hot.
 
 Data-plane evolution summary:
-- v1 (shipped): persistent per-VIP numgen rule. Works; stale on endpoint
-  change; no per-flow churn but in-kernel-only LB decision.
-- v2 (proven, mark-based): one static rule + `mark->endpoint` map; execd marks
-  the verdict. Zero per-flow nft ops; userspace LB decision; endpoint change =
-  atomic set-element update + conntrack flush.
+- v1: persistent per-VIP numgen rule. Works; stale on endpoint change; no
+  per-flow churn but in-kernel-only LB decision. (Superseded.)
+- v2 (SHIPPED, mark-based — poc/execd/services.go): one static rule +
+  `mark->endpoint` map; execd resolves (cached), picks a backend in userspace
+  (round-robin), sets the verdict mark. Zero per-flow nft ops. Endpoint change
+  reflected within the cache TTL (fixes v1 staleness); removal does a
+  best-effort conntrack flush. Verified: 4/4 LB split, one "LB active" log
+  line, backend deletion drains to the survivor with no pod restart. Byte-order
+  gotcha for the map key: `mark` set keys are native/little-endian (to match
+  `meta mark`); the DNAT reads addr from reg1 and port from reg2 (RegProtoMin
+  2, 16-byte register model); the concat map needs `Concatenation: false`
+  (that flag is for concatenated keys, not concat data).
 - v-next (north star): NFQUEUE verdict establishes the DNAT directly. One
   rule, no map, UDP-uniform, fully userspace-steered. Kernel primitive
   (possibly free via NFQA_CT; else a small upstreamable patch).
