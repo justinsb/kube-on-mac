@@ -186,7 +186,16 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
   `tty: true`), mirrors output to the console log, and serves exec/attach
   over vsock (guest port 1024 ↔ host unix socket in /tmp — sun_path is
   ~104 bytes on macOS, so the deep per-pod dir can't hold it).
-- **Single container per pod, no volumes**; control plane is envtest
+- **Volumes: hostPath and emptyDir only.** Each volume is its own virtio-fs
+  share (readOnly enforced VMM-side and with MS_RDONLY in the guest);
+  emptyDir lives under the pod state dir, surviving container restarts and
+  dying with the pod. Verified with real etcd (official arm64 image) keeping
+  its data across pod deletion. hostPath types File/Socket/etc., subPath,
+  configMap/secret/downward/projected volumes, and PVCs are not implemented
+  — the ServiceAccount token volume that admission injects into every pod is
+  skipped, everything else unsupported fails the mount (pod stays Pending in
+  FailedMount with backoff).
+- **Single container per pod**; control plane is envtest
   apiserver+etcd plus a real kube-controller-manager; still no
   kube-scheduler (the agent's bind-to-node loop stands in).
 

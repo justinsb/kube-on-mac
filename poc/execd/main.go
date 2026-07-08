@@ -73,13 +73,42 @@ type request struct {
 }
 
 type spec struct {
-	Argv []string  `json:"argv"`
-	Env  []string  `json:"env,omitempty"` // image config env + pod spec env
-	Cwd  string    `json:"cwd,omitempty"`
-	TTY  bool      `json:"tty"`
-	Net  *netSpec  `json:"net,omitempty"`
-	Net6 *net6Spec `json:"net6,omitempty"`
-	Svc  *svcSpec  `json:"svc,omitempty"`
+	Argv   []string    `json:"argv"`
+	Env    []string    `json:"env,omitempty"` // image config env + pod spec env
+	Cwd    string      `json:"cwd,omitempty"`
+	TTY    bool        `json:"tty"`
+	Net    *netSpec    `json:"net,omitempty"`
+	Net6   *net6Spec   `json:"net6,omitempty"`
+	Svc    *svcSpec    `json:"svc,omitempty"`
+	Mounts []mountSpec `json:"mounts,omitempty"` // pod volumes (virtio-fs tags)
+}
+
+type mountSpec struct {
+	Tag       string `json:"tag"`
+	MountPath string `json:"mountPath"`
+	ReadOnly  bool   `json:"readOnly,omitempty"`
+}
+
+// mountVolumes attaches the pod's volumes (extra virtio-fs devices added by
+// the harness) at their declared mountPaths. Failures are fatal: a workload
+// that expects a volume must not run without it (kubelet leaves such pods
+// stuck in ContainerCreating; our equivalent is the VM exiting).
+func mountVolumes(mounts []mountSpec) {
+	for _, m := range mounts {
+		if err := os.MkdirAll(m.MountPath, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "execd: volume %s: mkdir %s: %v\n", m.Tag, m.MountPath, err)
+			log.Fatalf("volume %s: mkdir %s: %v", m.Tag, m.MountPath, err)
+		}
+		var flags uintptr
+		if m.ReadOnly {
+			flags |= syscall.MS_RDONLY
+		}
+		if err := syscall.Mount(m.Tag, m.MountPath, "virtiofs", flags, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "execd: volume %s: mount %s: %v\n", m.Tag, m.MountPath, err)
+			log.Fatalf("volume %s: mount %s: %v", m.Tag, m.MountPath, err)
+		}
+		log.Printf("volume %s mounted at %s (ro=%v)", m.Tag, m.MountPath, m.ReadOnly)
+	}
 }
 
 type svcSpec struct {
@@ -333,6 +362,7 @@ func main() {
 		merged := mergeEnv(defaultEnv(), sp.Env)
 		workloadEnv = func() []string { return merged }
 	}
+	mountVolumes(sp.Mounts)
 
 	wl := &workload{}
 	cmd := exec.Command(sp.Argv[0], sp.Argv[1:]...)
@@ -344,6 +374,11 @@ func main() {
 	}
 	wl.cmd = cmd
 
+	// The output copiers must finish before cmd.Wait(): Wait closes the
+	// pipes on process exit, and a fast-exiting workload can be gone before
+	// the copy goroutines are ever scheduled — silently losing all output.
+	// (Observed in practice once extra virtiofs devices shifted scheduling.)
+	var copies sync.WaitGroup
 	if sp.TTY {
 		f, err := pty.Start(cmd)
 		if err != nil {
@@ -351,7 +386,8 @@ func main() {
 		}
 		wl.ptyFile = f
 		wl.stdinW = f
-		go io.Copy(wl, f)
+		copies.Add(1)
+		go func() { defer copies.Done(); io.Copy(wl, f) }()
 	} else {
 		stdout, _ := cmd.StdoutPipe()
 		stderr, _ := cmd.StderrPipe()
@@ -360,12 +396,14 @@ func main() {
 		if err := cmd.Start(); err != nil {
 			log.Fatalf("starting workload: %v", err)
 		}
-		go io.Copy(wl, stdout)
-		go io.Copy(os.Stderr, stderr)
+		copies.Add(2)
+		go func() { defer copies.Done(); io.Copy(wl, stdout) }()
+		go func() { defer copies.Done(); io.Copy(os.Stderr, stderr) }()
 	}
 
 	go serveVsock(wl)
 
+	copies.Wait()
 	err = cmd.Wait()
 	code := 0
 	if ee, ok := err.(*exec.ExitError); ok {

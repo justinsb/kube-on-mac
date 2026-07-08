@@ -10,8 +10,9 @@
 // logs/exec/attach via the :10250 kubelet server, startup/readiness/liveness
 // probes (exec + in-guest http/tcp via execd), graceful termination
 // (SIGTERM in the guest, SIGKILL after grace), restartPolicy with naive
-// crash backoff. Still missing: port-forward, volumes beyond the rootfs,
-// pod networking, authn/authz on the kubelet server.
+// crash backoff, hostPath/emptyDir volumes (per-volume virtio-fs shares).
+// Still missing: port-forward, configMap/secret/projected volumes,
+// authn/authz on the kubelet server.
 package main
 
 import (
@@ -477,13 +478,21 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 		a.setPhase(ctx, pod, corev1.PodFailed, reason, err.Error(), nil)
 	}
 
-	// Image pull failures don't fail the pod: like the kubelet, keep it
-	// Pending in ErrImagePull and retry with backoff (a Failed pod would be
-	// replaced by the deployment controller, churning a doomed pod forever).
+	// Image pull / volume failures don't fail the pod: like the kubelet,
+	// keep it Pending (ErrImagePull / FailedMount) and retry with backoff
+	// (a Failed pod would be replaced by its ReplicaSet, churning a doomed
+	// pod forever).
 	var dir, rootfsBase string
+	var volArgs []string
+	var mounts []volumeMount
 	for attempt := 0; ; attempt++ {
 		var err error
+		reason := "ErrImagePull"
 		dir, rootfsBase, err = a.preparePod(pod)
+		if err == nil {
+			reason = "FailedMount"
+			volArgs, mounts, err = resolveVolumes(pod, dir)
+		}
 		if err == nil {
 			break
 		}
@@ -492,12 +501,12 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			return
 		}
 		backoff := time.Duration(10<<min(attempt, 5)) * time.Second
-		log.Printf("pod %s/%s: ErrImagePull (retrying in %s): %v", pod.Namespace, pod.Name, backoff, err)
+		log.Printf("pod %s/%s: %s (retrying in %s): %v", pod.Namespace, pod.Name, reason, backoff, err)
 		a.setPhase(ctx, pod, corev1.PodPending, "", "", &corev1.ContainerStatus{
 			Name:  pod.Spec.Containers[0].Name,
 			Image: pod.Spec.Containers[0].Image,
 			State: corev1.ContainerState{
-				Waiting: &corev1.ContainerStateWaiting{Reason: "ErrImagePull", Message: err.Error()},
+				Waiting: &corev1.ContainerStateWaiting{Reason: reason, Message: err.Error()},
 			},
 		})
 		deadline := time.Now().Add(backoff)
@@ -529,7 +538,8 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 	for attempt := 0; ; attempt++ {
 		// Fresh container filesystem for every (re)start, matching kubelet
 		// semantics. The clone is an APFS clonefile copy, so this is cheap.
-		rootfs, err := a.makeRootfs(pod, dir, rootfsBase)
+		// (Volumes live outside the rootfs and persist across restarts.)
+		rootfs, err := a.makeRootfs(pod, dir, rootfsBase, mounts)
 		if err != nil {
 			fail("StartError", err)
 			return
@@ -551,6 +561,7 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			"--log", filepath.Join(dir, "vmm.log"),
 			"--vsock-exec", execSockPath(pod.UID),
 		}
+		harnessArgs = append(harnessArgs, volArgs...)
 		var gvp *exec.Cmd
 		if a.gvproxyPath != "" {
 			netSock := netSockPath(pod.UID)
@@ -778,7 +789,7 @@ func (a *agent) preparePod(pod *corev1.Pod) (string, string, error) {
 
 // makeRootfs materializes a fresh container filesystem from the image base,
 // discarding any previous one, and installs execd + the workload spec.
-func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string) (string, error) {
+func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string, mounts []volumeMount) (string, error) {
 	c := pod.Spec.Containers[0]
 	rootfs := filepath.Join(dir, "rootfs")
 
@@ -836,6 +847,9 @@ func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string) (string, err
 	if cwd != "" {
 		specData["cwd"] = cwd
 	}
+	if len(mounts) > 0 {
+		specData["mounts"] = mounts
+	}
 	if a.vmnetHelper != "" {
 		specData["net6"] = map[string]string{
 			"ip": podIP6(a.podCIDR6, pod.UID).String() + "/64",
@@ -862,6 +876,92 @@ func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string) (string, err
 		return "", err
 	}
 	return rootfs, nil
+}
+
+// volumeMount is one entry of the guest-side mount plan (spec JSON).
+type volumeMount struct {
+	Tag       string `json:"tag"`
+	MountPath string `json:"mountPath"`
+	ReadOnly  bool   `json:"readOnly,omitempty"`
+}
+
+// resolveVolumes turns the pod's volumes + the container's volumeMounts into
+// harness --volume args (one virtio-fs device per volume) and the guest-side
+// mount plan. Supported: hostPath (Directory / DirectoryOrCreate / "") and
+// emptyDir (a host dir under the pod state dir, so it survives container
+// restarts and dies with the pod — kubelet semantics). Projected volumes
+// (the auto-injected ServiceAccount token) are skipped quietly; anything
+// else is an error, matching a kubelet that can't set up a volume.
+func resolveVolumes(pod *corev1.Pod, stateDir string) (harnessArgs []string, mounts []volumeMount, err error) {
+	c := pod.Spec.Containers[0]
+	if len(c.VolumeMounts) == 0 {
+		return nil, nil, nil
+	}
+	byName := map[string]*corev1.Volume{}
+	for i := range pod.Spec.Volumes {
+		byName[pod.Spec.Volumes[i].Name] = &pod.Spec.Volumes[i]
+	}
+	// A volume's virtio-fs device is read-only only if every mount of it is.
+	anyRW := map[string]bool{}
+	for _, m := range c.VolumeMounts {
+		if !m.ReadOnly {
+			anyRW[m.Name] = true
+		}
+	}
+	tags := map[string]string{} // volume name -> tag
+	for _, m := range c.VolumeMounts {
+		vol := byName[m.Name]
+		if vol == nil {
+			return nil, nil, fmt.Errorf("volumeMount %q: no such volume", m.Name)
+		}
+		if m.SubPath != "" || m.SubPathExpr != "" {
+			return nil, nil, fmt.Errorf("volumeMount %q: subPath not supported", m.Name)
+		}
+		var hostDir string
+		switch {
+		case vol.Projected != nil:
+			// ServiceAccount token projection, injected by admission into
+			// every pod. Not implemented; skipping it keeps all pods usable.
+			continue
+		case vol.HostPath != nil:
+			hostDir = vol.HostPath.Path
+			t := corev1.HostPathUnset
+			if vol.HostPath.Type != nil {
+				t = *vol.HostPath.Type
+			}
+			switch t {
+			case corev1.HostPathUnset, corev1.HostPathDirectory:
+				if st, err := os.Stat(hostDir); err != nil || !st.IsDir() {
+					return nil, nil, fmt.Errorf("hostPath %q: not an existing directory", hostDir)
+				}
+			case corev1.HostPathDirectoryOrCreate:
+				if err := os.MkdirAll(hostDir, 0o755); err != nil {
+					return nil, nil, fmt.Errorf("hostPath %q: %w", hostDir, err)
+				}
+			default:
+				return nil, nil, fmt.Errorf("hostPath type %q not supported (Directory/DirectoryOrCreate only)", t)
+			}
+		case vol.EmptyDir != nil:
+			hostDir = filepath.Join(stateDir, "volumes", vol.Name)
+			if err := os.MkdirAll(hostDir, 0o755); err != nil {
+				return nil, nil, fmt.Errorf("emptyDir %q: %w", vol.Name, err)
+			}
+		default:
+			return nil, nil, fmt.Errorf("volume %q: only hostPath and emptyDir are supported", vol.Name)
+		}
+		tag, ok := tags[vol.Name]
+		if !ok {
+			tag = fmt.Sprintf("vol%d", len(tags))
+			tags[vol.Name] = tag
+			arg := tag + "=" + hostDir
+			if !anyRW[vol.Name] {
+				arg += ":ro" // VMM-side enforcement; guest adds MS_RDONLY per mount
+			}
+			harnessArgs = append(harnessArgs, "--volume", arg)
+		}
+		mounts = append(mounts, volumeMount{Tag: tag, MountPath: m.MountPath, ReadOnly: m.ReadOnly})
+	}
+	return harnessArgs, mounts, nil
 }
 
 func (a *agent) setPhase(ctx context.Context, pod *corev1.Pod, phase corev1.PodPhase, reason, message string, cs *corev1.ContainerStatus) {

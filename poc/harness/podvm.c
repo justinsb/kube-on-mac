@@ -58,6 +58,11 @@ int main(int argc, char *const argv[])
     long mem_mib = 256;
     long dax_mib = 0;
 
+    /* Extra virtio-fs shares (pod volumes): --volume TAG=PATH[:ro] */
+#define MAX_VOLUMES 32
+    struct { const char *tag; char *path; bool ro; } volumes[MAX_VOLUMES];
+    int n_volumes = 0;
+
     static const struct option opts[] = {
         { "kernel", required_argument, NULL, 'k' },
         { "rootfs", required_argument, NULL, 'r' },
@@ -70,12 +75,13 @@ int main(int argc, char *const argv[])
         { "net-socket", required_argument, NULL, 'n' },
         { "net2-socket", required_argument, NULL, 'N' },
         { "net2-mac", required_argument, NULL, 'M' },
+        { "volume", required_argument, NULL, 'v' },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "+k:r:c:m:d:l:x:S:n:N:M:h", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "+k:r:c:m:d:l:x:S:n:N:M:v:h", opts, NULL)) != -1) {
         switch (c) {
         case 'k': kernel_path = optarg; break;
         case 'r': rootfs = optarg; break;
@@ -88,6 +94,28 @@ int main(int argc, char *const argv[])
         case 'n': net_socket_path = optarg; break;
         case 'N': net2_socket_path = optarg; break;
         case 'M': net2_mac = optarg; break;
+        case 'v': {
+            if (n_volumes >= MAX_VOLUMES) {
+                fprintf(stderr, "too many --volume args (max %d)\n", MAX_VOLUMES);
+                return 1;
+            }
+            char *eq = strchr(optarg, '=');
+            if (eq == NULL || eq == optarg || eq[1] == '\0') {
+                fprintf(stderr, "bad --volume %s (want TAG=PATH[:ro])\n", optarg);
+                return 1;
+            }
+            *eq = '\0';
+            volumes[n_volumes].tag = optarg;
+            volumes[n_volumes].path = eq + 1;
+            volumes[n_volumes].ro = false;
+            size_t plen = strlen(volumes[n_volumes].path);
+            if (plen > 3 && strcmp(volumes[n_volumes].path + plen - 3, ":ro") == 0) {
+                volumes[n_volumes].path[plen - 3] = '\0';
+                volumes[n_volumes].ro = true;
+            }
+            n_volumes++;
+            break;
+        }
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 1;
         }
@@ -149,6 +177,16 @@ int main(int argc, char *const argv[])
                                  (uint64_t)dax_mib * 1024 * 1024, false),
               "krun_add_virtiofs3"))
         return 1;
+
+    /* Pod volumes: one additional virtio-fs device per volume; execd mounts
+     * them by tag at the declared mountPaths. read-only is enforced VMM-side
+     * here, and again with MS_RDONLY per-mount in the guest. */
+    for (int i = 0; i < n_volumes; i++) {
+        if (check(krun_add_virtiofs3(ctx, volumes[i].tag, volumes[i].path, 0,
+                                     volumes[i].ro),
+                  "krun_add_virtiofs3 (volume)"))
+            return 1;
+    }
 
     /* vsock device, no TSI: TSI needs libkrunfw's patched guest kernel, and
      * the Kata kernel is vanilla — the tsi_hijack cmdline flag would just be

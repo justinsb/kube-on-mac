@@ -143,6 +143,13 @@ Each step lands value on its own; the flip comes last.
    SA token projection). Caution to measure: etcd is fsync-heavy; verify
    virtiofs fsync durability and throughput on APFS before trusting it with
    the cluster's only state.
+   **DONE (2026-07-08):** hostPath (Directory/DirectoryOrCreate) + emptyDir,
+   one virtio-fs device per volume, readOnly enforced VMM-side. Acceptance
+   test passed: official `registry.k8s.io/etcd:3.5.15-0` (arm64) in a
+   microVM on a hostPath data dir — key written, pod deleted and recreated,
+   key survived. fsync numbers below. (Bonus find: a day-one execd race
+   silently dropped fast-exiting workloads' output; extra virtiofs device
+   threads exposed it. Fixed.)
 2. **Static pods + mirror pods** in the agent, proven with something
    trivial (a static nginx) before the control plane rides on it.
 3. **Pinned pod IPs** and the **gvproxy 6443 forward** (both small).
@@ -150,6 +157,34 @@ Each step lands value on its own; the flip comes last.
 5. **The flip**: control plane from official `registry.k8s.io` arm64 images
    via `manifests/`, then delete envtest and `agent/kcm.go`. kube-scheduler
    arrives here as a static pod on day one — it never needs a darwin build.
+
+## Measured: etcd's disk pattern over virtiofs (2026-07-08)
+
+The plan rests on trusting virtiofs with the cluster's only mutable state,
+so this was measured first, inside a microVM against the virtiofs rootfs
+(the identical data path a hostPath volume uses). etcd's canonical fio
+benchmark — `--rw=write --ioengine=sync --fdatasync=1 --bs=2300 --size=22m`
+(WAL-sized writes, sync after each); the etcd docs' bar is **p99 fdatasync
+< 10ms**:
+
+```
+write: IOPS=10.6k, BW=23.4MiB/s
+fdatasync percentiles (usec):
+  50th=33  90th=41  99th=84  99.9th=147  99.99th=1352
+```
+
+**p99 = 84µs — two orders of magnitude inside the bar.** Control run
+without `--fdatasync=1`: 32k IOPS, i.e. each sync costs a real ~35µs
+(virtqueue round-trip → host `fsync(2)`), confirming syncs pass through to
+the host rather than being absorbed in the guest.
+
+Durability caveat, stated honestly: on macOS, `fsync(2)` flushes to the
+drive but *not* the drive cache — full power-loss durability needs
+`F_FULLFSYNC`, which is what makes native mac databases slow. So etcd in a
+microVM here gets exactly the durability of any mac-native database using
+plain fsync: survives guest crash, VMM crash, and host process crash;
+a power cut can lose the last moments. For a dev cluster that is the right
+trade, and it isn't a virtiofs limitation — it's the host OS contract.
 
 ## Open questions
 
