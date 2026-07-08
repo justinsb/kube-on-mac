@@ -1,0 +1,33 @@
+# SOURCE: https://cloud.google.com/kubernetes-engine/docs/tutorials/guestbook
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-follower
+  labels:
+    app: redis
+    role: follower
+    tier: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+        role: follower
+        tier: backend
+    spec:
+      containers:
+      - name: follower
+        # DIVERGENCE (arm64): gb-redis-follower:v2 is amd64-only; same image
+        # rebuilt for linux/arm64 from Google's published source
+        # (kubernetes-engine-samples quickstarts/guestbook/redis-follower).
+        image: ttl.sh/kube-on-macos-gb-redis-follower:24h
+        resources:
+          requests:
+            cpu: 100m
+            memory: 100Mi
+        ports:
+        - containerPort: 6379

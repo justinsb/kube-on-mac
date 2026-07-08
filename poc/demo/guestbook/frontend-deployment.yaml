@@ -1,0 +1,33 @@
+# SOURCE: https://cloud.google.com/kubernetes-engine/docs/tutorials/guestbook
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+        app: guestbook
+        tier: frontend
+  template:
+    metadata:
+      labels:
+        app: guestbook
+        tier: frontend
+    spec:
+      containers:
+      - name: php-redis
+        # DIVERGENCE (arm64): gb-frontend:v5 is amd64-only; same image rebuilt
+        # for linux/arm64 from Google's published source (kubernetes-engine-samples
+        # quickstarts/guestbook/php-redis, with FROM php:7.4-apache -- buster
+        # repos are archived -- and git-all -> git).
+        image: ttl.sh/kube-on-macos-gb-frontend:24h
+        env:
+        - name: GET_HOSTS_FROM
+          value: "dns"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 100Mi
+        ports:
+        - containerPort: 80

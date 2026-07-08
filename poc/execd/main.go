@@ -74,6 +74,8 @@ type request struct {
 
 type spec struct {
 	Argv []string  `json:"argv"`
+	Env  []string  `json:"env,omitempty"` // image config env + pod spec env
+	Cwd  string    `json:"cwd,omitempty"`
 	TTY  bool      `json:"tty"`
 	Net  *netSpec  `json:"net,omitempty"`
 	Net6 *net6Spec `json:"net6,omitempty"`
@@ -81,7 +83,8 @@ type spec struct {
 }
 
 type svcSpec struct {
-	CIDR string `json:"cidr"` // ClusterIP range, e.g. fd42:6b75:6265:1::/112
+	CIDR      string `json:"cidr"`         // ClusterIP range, e.g. fd42:6b75:6265:1::/112
+	Namespace string `json:"ns,omitempty"` // pod namespace (DNS search path)
 }
 
 type net6Spec struct {
@@ -157,6 +160,35 @@ func defaultEnv() []string {
 		"HOME=/root",
 		"TERM=xterm",
 	}
+}
+
+// workloadEnv is the pod's environment: defaults overridden by the spec env
+// (image config env + pod spec env, merged host-side). Exec sessions get the
+// same view, matching kubelet. workloadCwd likewise.
+var (
+	workloadEnv = defaultEnv
+	workloadCwd string
+)
+
+func mergeEnv(base, override []string) []string {
+	idx := map[string]int{}
+	var out []string
+	add := func(kv string) {
+		k, _, _ := strings.Cut(kv, "=")
+		if i, ok := idx[k]; ok {
+			out[i] = kv
+			return
+		}
+		idx[k] = len(out)
+		out = append(out, kv)
+	}
+	for _, kv := range base {
+		add(kv)
+	}
+	for _, kv := range override {
+		add(kv)
+	}
+	return out
 }
 
 // framedConn serializes frame writes (multiple copiers share one conn).
@@ -277,11 +309,39 @@ func main() {
 				log.Printf("service LB setup failed: %v (services unavailable)", err)
 			}
 		}()
+		// Cluster DNS rides the same lazy channel. Bind before the workload
+		// starts so names resolve from its very first syscall; on failure the
+		// gvproxy resolv.conf from configureNet stays (external DNS only).
+		upstream := ""
+		if sp.Net != nil && sp.Net.DNS != "" {
+			upstream = net.JoinHostPort(sp.Net.DNS, "53")
+		}
+		if err := startDNSProxy(upstream); err != nil {
+			log.Printf("dns proxy failed: %v (cluster DNS unavailable)", err)
+		} else {
+			ns := sp.Svc.Namespace
+			if ns == "" {
+				ns = "default"
+			}
+			search := fmt.Sprintf("%s.svc.cluster.local svc.cluster.local cluster.local", ns)
+			os.WriteFile("/etc/resolv.conf",
+				[]byte("nameserver 127.0.0.1\nsearch "+search+"\noptions ndots:5\n"), 0o644)
+			log.Printf("cluster dns up: 127.0.0.1:53 (search %s, upstream %s)", search, upstream)
+		}
+	}
+	if len(sp.Env) > 0 {
+		merged := mergeEnv(defaultEnv(), sp.Env)
+		workloadEnv = func() []string { return merged }
 	}
 
 	wl := &workload{}
 	cmd := exec.Command(sp.Argv[0], sp.Argv[1:]...)
-	cmd.Env = defaultEnv()
+	cmd.Env = workloadEnv()
+	if sp.Cwd != "" {
+		os.MkdirAll(sp.Cwd, 0o755) // images may declare a WORKDIR the tar lacks
+		cmd.Dir = sp.Cwd
+		workloadCwd = sp.Cwd
+	}
 	wl.cmd = cmd
 
 	if sp.TTY {
@@ -455,7 +515,8 @@ func handleExec(fc *framedConn, req request) {
 		return
 	}
 	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
-	cmd.Env = defaultEnv()
+	cmd.Env = workloadEnv()
+	cmd.Dir = workloadCwd
 
 	var ptyF *os.File
 	var stdinW io.WriteCloser

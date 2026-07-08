@@ -34,9 +34,10 @@ hello-macos   1/1     Running   0          4s
   stdout/stderr stream to the harness's stdio. Signed ad-hoc with the
   `com.apple.security.hypervisor` entitlement.
 - `agent/` — the PoC node agent (Go). Boots kube-apiserver + etcd locally
-  (envtest binaries), writes an admin kubeconfig, registers the Node,
-  heartbeats Ready, binds unassigned pods (stand-in for kube-scheduler), and
-  reconciles bound pods into `podvm` processes. One pod = one microVM.
+  (envtest binaries) and a real kube-controller-manager, writes an admin
+  kubeconfig, registers the Node, heartbeats Ready (status + node Lease),
+  binds unassigned pods (stand-in for kube-scheduler), and reconciles bound
+  pods into `podvm` processes. One pod = one microVM.
 - `execd/` — the in-guest supervisor/exec daemon (Go, built static for
   linux/arm64 into `_artifacts/execd`; the agent clones it into each pod
   rootfs and `/entry.sh` execs it).
@@ -73,6 +74,13 @@ Prereqs: Xcode CLT, Homebrew (`rustup`, `llvm`, `lld`, `xz`), Go.
    `_artifacts/gvproxy`.
 6. Envtest binaries:
    `go run sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.21 use 1.33.0 --bin-dir _artifacts/envtest -p path`
+6. kube-controller-manager (envtest doesn't ship it; it's pure Go and builds
+   natively on macOS):
+   `git clone --depth 1 --branch v1.33.0 https://github.com/kubernetes/kubernetes`
+   then in that tree
+   `go build -o <poc>/_artifacts/kube-controller-manager ./cmd/kube-controller-manager`
+   (or `--kube-controller-manager=''` to run without it — Deployments etc.
+   will be inert).
 6. `cd agent && go build -o agent . && ./agent --assets ../_artifacts/envtest/k8s/1.33.0-darwin-arm64`
 7. In another shell:
    `export KUBECONFIG=$PWD/_artifacts/kubeconfig; kubectl get nodes; kubectl apply -f demo/pod.yaml`
@@ -94,7 +102,11 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
   go-containerregistry), flattened to a rootfs dir, and cached under
   `_artifacts/images/`; pods get APFS clones. No layer store, no
   imagePullSecrets, anonymous registry auth only. Pods with no command use
-  the image's Entrypoint/Cmd; image env vars/WorkingDir are not yet honored.
+  the image's Entrypoint/Cmd; image env vars and WorkingDir are honored (pod
+  spec `env`/`workingDir` override them; `env.valueFrom` is not implemented).
+  Pull-by-digest of a non-arm64 image fails with an explicit architecture
+  error; pull failures keep the pod Pending in `ErrImagePull` with doubling
+  backoff (kubelet-style) instead of failing the pod.
 - **Host filesystem semantics leak into guests** (verified empirically):
   the rootfs is a virtiofs share of an APFS directory, so guests see APFS
   case-insensitivity (`/Foo` and `/foo` are the same file) and host
@@ -135,6 +147,22 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
   best-effort (shells out to `conntrack`, absent from most images) so
   long-lived flows to a removed backend aren't force-reset; no
   affinity/weights/topology; no named ports.
+- **Cluster DNS is real, lazily, with no DNS server to run.** execd serves
+  DNS on each pod's loopback (kubelet-standard resolv.conf: search path +
+  ndots:5); `<svc>.<ns>.svc.cluster.local` resolves over the same vsock
+  channel as the service LB (agent answers from apiserver state, 5s TTL),
+  everything else forwards to gvproxy's resolver. `redis-server --replicaof
+  redis-leader 6379` and PHP/Predis both just work (see
+  docs/walkthrough.md). No headless-service endpoints, SRV, or pod records.
+- **The real kube-controller-manager runs** (built from the kubernetes tree
+  for darwin/arm64 — envtest doesn't ship it; the agent spawns and
+  supervises it, wired to envtest's service-account signing key). So
+  Deployments → ReplicaSets → pods, rolling updates (`kubectl rollout`),
+  EndpointSlices, garbage-collection cascades, namespace deletion, and
+  default-ServiceAccount creation are all the genuine articles; the agent
+  renews a node Lease (kubelet contract) so the node-lifecycle controller
+  stays happy. The full guestbook tutorial runs on this, rolling updates
+  included — see docs/walkthrough.md.
 - **Partial kubelet server**: `kubectl logs` (with `-f`, `--tail`),
   `kubectl exec` (including `-it` with pty + resize + exit codes), and
   `kubectl attach` (so `kubectl run -it --image=debian:latest -- bash`
@@ -158,9 +186,9 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
   `tty: true`), mirrors output to the console log, and serves exec/attach
   over vsock (guest port 1024 ↔ host unix socket in /tmp — sun_path is
   ~104 bytes on macOS, so the deep per-pod dir can't hold it).
-- **No probes, single container per pod, no volumes**, restartPolicy only
-  honored as never-restart, control plane is envtest (no controller-manager,
-  agent includes a 20-line bind-to-node "scheduler").
+- **Single container per pod, no volumes**; control plane is envtest
+  apiserver+etcd plus a real kube-controller-manager; still no
+  kube-scheduler (the agent's bind-to-node loop stands in).
 
 ## Measured
 

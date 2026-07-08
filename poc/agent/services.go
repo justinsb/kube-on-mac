@@ -21,14 +21,19 @@ import (
 // ClusterIP it hasn't seen, and asks for endpoints. JSON lines.
 
 type svcQuery struct {
-	VIP   string `json:"vip"`
-	Port  int    `json:"port"`
-	Proto string `json:"proto"` // "tcp" or "udp"
+	VIP   string `json:"vip,omitempty"`
+	Port  int    `json:"port,omitempty"`
+	Proto string `json:"proto,omitempty"` // "tcp" or "udp"
+
+	// DNS-style lookup instead: service name -> ClusterIPs.
+	Name      string `json:"name,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
 }
 
 type svcAnswer struct {
 	Endpoints  []string `json:"endpoints"` // pod IPv6 addresses
 	TargetPort int      `json:"targetPort"`
+	ClusterIPs []string `json:"clusterIPs,omitempty"`
 	TTLSeconds int      `json:"ttl"`
 	Error      string   `json:"error,omitempty"`
 }
@@ -79,10 +84,14 @@ func (a *agent) serveSvcConn(ctx context.Context, conn net.Conn) {
 	}
 }
 
-// resolveService maps a ClusterIP:port to ready endpoint pod IPs. There is
-// no controller-manager in the PoC (nothing writes EndpointSlices), so
-// endpoints are computed directly: Service selector -> Running+Ready pods.
+// resolveService maps a ClusterIP:port to ready endpoint pod IPs, computed
+// directly: Service selector -> Running+Ready pods. (kube-controller-manager
+// now writes real EndpointSlices; switching this to consume them instead of
+// re-deriving from selectors is a possible simplification.)
 func (a *agent) resolveService(ctx context.Context, q svcQuery) svcAnswer {
+	if q.Name != "" {
+		return a.resolveServiceName(ctx, q)
+	}
 	proto := strings.ToUpper(q.Proto)
 	if proto == "" {
 		proto = "TCP"
@@ -141,6 +150,25 @@ func (a *agent) resolveService(ctx context.Context, q svcQuery) svcAnswer {
 		return svcAnswer{Endpoints: eps, TargetPort: targetPort, TTLSeconds: 30}
 	}
 	return svcAnswer{Error: "no service with ClusterIP " + q.VIP}
+}
+
+// resolveServiceName is the DNS half of the lazy protocol: service name ->
+// ClusterIPs (execd serves them as A/AAAA records in the guest).
+func (a *agent) resolveServiceName(ctx context.Context, q svcQuery) svcAnswer {
+	ns := q.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	svc, err := a.client.CoreV1().Services(ns).Get(ctx, q.Name, metav1.GetOptions{})
+	if err != nil {
+		return svcAnswer{Error: err.Error(), TTLSeconds: 5}
+	}
+	ips := svc.Spec.ClusterIPs
+	if len(ips) == 0 && svc.Spec.ClusterIP != "" && svc.Spec.ClusterIP != corev1.ClusterIPNone {
+		ips = []string{svc.Spec.ClusterIP}
+	}
+	log.Printf("dns query %s.%s -> %v", q.Name, ns, ips)
+	return svcAnswer{ClusterIPs: ips, TTLSeconds: 5}
 }
 
 func clusterIPMatches(svc *corev1.Service, vip string) bool {

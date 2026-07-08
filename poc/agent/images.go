@@ -45,6 +45,15 @@ func (a *agent) ensureImage(image string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("fetching image: %w", err)
 	}
+	// Pulling by digest (or a single-arch tag) bypasses platform selection
+	// and silently yields whatever the manifest is; an amd64 rootfs can't run
+	// in these VMs, so fail with the real reason instead of exec/extract
+	// weirdness later.
+	if cf, err := img.ConfigFile(); err == nil {
+		if cf.Architecture != "arm64" || cf.OS != "linux" {
+			return "", fmt.Errorf("image is %s/%s; this node runs only linux/arm64 microVMs (no emulation)", cf.OS, cf.Architecture)
+		}
+	}
 
 	tmp := dir + ".tmp"
 	os.RemoveAll(tmp)
@@ -86,6 +95,32 @@ func imageArgv(rootfsBase string) []string {
 		return nil
 	}
 	return append(append([]string{}, cf.Config.Entrypoint...), cf.Config.Cmd...)
+}
+
+// imageEnv returns the image config's Env from the cached image config.
+func imageEnv(rootfsBase string) []string {
+	data, err := os.ReadFile(rootfsBase + ".config.json")
+	if err != nil {
+		return nil
+	}
+	var cf v1.ConfigFile
+	if err := json.Unmarshal(data, &cf); err != nil {
+		return nil
+	}
+	return cf.Config.Env
+}
+
+// imageWorkingDir returns the image config's WorkingDir.
+func imageWorkingDir(rootfsBase string) string {
+	data, err := os.ReadFile(rootfsBase + ".config.json")
+	if err != nil {
+		return ""
+	}
+	var cf v1.ConfigFile
+	if err := json.Unmarshal(data, &cf); err != nil {
+		return ""
+	}
+	return cf.Config.WorkingDir
 }
 
 // untar extracts a flattened image tar (whiteouts already applied by

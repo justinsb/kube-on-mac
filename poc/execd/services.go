@@ -42,14 +42,19 @@ const (
 )
 
 type svcQuery struct {
-	VIP   string `json:"vip"`
-	Port  int    `json:"port"`
-	Proto string `json:"proto"`
+	VIP   string `json:"vip,omitempty"`
+	Port  int    `json:"port,omitempty"`
+	Proto string `json:"proto,omitempty"`
+
+	// DNS-style lookup instead: service name -> ClusterIPs.
+	Name      string `json:"name,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
 }
 
 type svcAnswer struct {
 	Endpoints  []string `json:"endpoints"`
 	TargetPort int      `json:"targetPort"`
+	ClusterIPs []string `json:"clusterIPs,omitempty"`
 	TTLSeconds int      `json:"ttl"`
 	Error      string   `json:"error,omitempty"`
 }

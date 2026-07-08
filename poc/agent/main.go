@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -147,6 +148,7 @@ func main() {
 		svcCIDR6      = flag.String("service-cidr6", "fd42:6b75:6265:1::/112", "IPv6 range for ClusterIPs")
 		svcCIDR4      = flag.String("service-cidr4", "10.96.0.0/16", "IPv4 service range (primary; keeps the apiserver's own kubernetes service happy)")
 		assetsDir     = flag.String("assets", "", "envtest binary assets dir (kube-apiserver, etcd)")
+		kcmPath       = flag.String("kube-controller-manager", "../_artifacts/kube-controller-manager", "path to kube-controller-manager (darwin/arm64, built from the k8s tree; empty to disable — Deployments etc. will be inert)")
 		kubeconfigOut = flag.String("kubeconfig-out", "../_artifacts/kubeconfig", "where to write admin kubeconfig")
 		kubeletPort   = flag.Int("kubelet-port", 10250, "port for the kubelet server (kubectl logs)")
 	)
@@ -164,10 +166,7 @@ func main() {
 	if *assetsDir != "" {
 		env.BinaryAssetsDirectory = *assetsDir
 	}
-	// No controller-manager runs here, so the ServiceAccount admission
-	// plugin would reject pods (no auto-created default SA). Disable it.
 	env.ControlPlane.GetAPIServer().Configure().
-		Append("disable-admission-plugins", "ServiceAccount").
 		// The apiserver prefers the node's Hostname address for kubelet
 		// connections (logs/exec); "macos-poc" doesn't resolve, so use the
 		// InternalIP we register (127.0.0.1).
@@ -234,6 +233,18 @@ func main() {
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sigc; log.Printf("shutting down"); cancel() }()
+
+	if *kcmPath != "" {
+		p, err := filepath.Abs(*kcmPath)
+		if err != nil {
+			log.Fatalf("abs %q: %v", *kcmPath, err)
+		}
+		kcmLog := filepath.Join(filepath.Dir(*kubeconfigOut), "kcm.log")
+		if err := startControllerManager(ctx, p, *kubeconfigOut,
+			env.ControlPlane.GetAPIServer().CertDir, kcmLog); err != nil {
+			log.Fatalf("starting kube-controller-manager: %v", err)
+		}
+	}
 
 	if err := a.startKubeletServer(ctx, *kubeletPort); err != nil {
 		log.Fatalf("starting kubelet server: %v", err)
@@ -336,7 +347,34 @@ func (a *agent) heartbeatLoop(ctx context.Context) {
 			}
 			node.Status = a.nodeStatus()
 			a.client.CoreV1().Nodes().UpdateStatus(ctx, node, metav1.UpdateOptions{})
+			a.renewNodeLease(ctx)
 		}
+	}
+}
+
+// renewNodeLease keeps the node's kube-node-lease Lease fresh — the health
+// signal kube-controller-manager's node-lifecycle controller watches. Without
+// it the node would be marked NotReady and every pod taint-evicted.
+func (a *agent) renewNodeLease(ctx context.Context) {
+	leases := a.client.CoordinationV1().Leases(corev1.NamespaceNodeLease)
+	now := metav1.NewMicroTime(time.Now())
+	lease, err := leases.Get(ctx, a.nodeName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		duration := int32(40)
+		_, err = leases.Create(ctx, &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{Name: a.nodeName, Namespace: corev1.NamespaceNodeLease},
+			Spec: coordinationv1.LeaseSpec{
+				HolderIdentity:       &a.nodeName,
+				LeaseDurationSeconds: &duration,
+				RenewTime:            &now,
+			},
+		}, metav1.CreateOptions{})
+	} else if err == nil {
+		lease.Spec.RenewTime = &now
+		_, err = leases.Update(ctx, lease, metav1.UpdateOptions{})
+	}
+	if err != nil {
+		log.Printf("renewing node lease: %v", err)
 	}
 }
 
@@ -439,10 +477,43 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 		a.setPhase(ctx, pod, corev1.PodFailed, reason, err.Error(), nil)
 	}
 
-	dir, rootfsBase, err := a.preparePod(pod)
-	if err != nil {
-		fail("StartError", err)
-		return
+	// Image pull failures don't fail the pod: like the kubelet, keep it
+	// Pending in ErrImagePull and retry with backoff (a Failed pod would be
+	// replaced by the deployment controller, churning a doomed pod forever).
+	var dir, rootfsBase string
+	for attempt := 0; ; attempt++ {
+		var err error
+		dir, rootfsBase, err = a.preparePod(pod)
+		if err == nil {
+			break
+		}
+		if len(pod.Spec.Containers) == 0 {
+			fail("StartError", err)
+			return
+		}
+		backoff := time.Duration(10<<min(attempt, 5)) * time.Second
+		log.Printf("pod %s/%s: ErrImagePull (retrying in %s): %v", pod.Namespace, pod.Name, backoff, err)
+		a.setPhase(ctx, pod, corev1.PodPending, "", "", &corev1.ContainerStatus{
+			Name:  pod.Spec.Containers[0].Name,
+			Image: pod.Spec.Containers[0].Image,
+			State: corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{Reason: "ErrImagePull", Message: err.Error()},
+			},
+		})
+		deadline := time.Now().Add(backoff)
+		for time.Now().Before(deadline) && !vm.isStopping() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+		}
+		if vm.isStopping() {
+			zero := int64(0)
+			a.client.CoreV1().Pods(pod.Namespace).Delete(context.Background(), pod.Name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+			return
+		}
 	}
 	c := pod.Spec.Containers[0]
 
@@ -742,11 +813,34 @@ func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string) (string, err
 		return "", fmt.Errorf("no command: pod spec has none and image config has no Entrypoint/Cmd")
 	}
 	specData := map[string]any{"argv": argv, "tty": c.TTY}
+	// Environment: image config env, overridden by pod spec env. valueFrom
+	// (fieldRef/configMap/secret) is not implemented.
+	env := imageEnv(rootfsBase)
+	for _, e := range c.Env {
+		if e.ValueFrom != nil {
+			log.Printf("pod %s/%s: env %s uses valueFrom (not implemented); skipping", pod.Namespace, pod.Name, e.Name)
+			continue
+		}
+		env = append(env, e.Name+"="+e.Value)
+	}
+	if len(env) > 0 {
+		specData["env"] = env
+	}
+	// Working directory: pod spec overrides image config. Without this,
+	// entrypoints that operate on "." (e.g. redis's chown of its WORKDIR
+	// /data) run against / instead.
+	cwd := c.WorkingDir
+	if cwd == "" {
+		cwd = imageWorkingDir(rootfsBase)
+	}
+	if cwd != "" {
+		specData["cwd"] = cwd
+	}
 	if a.vmnetHelper != "" {
 		specData["net6"] = map[string]string{
 			"ip": podIP6(a.podCIDR6, pod.UID).String() + "/64",
 		}
-		specData["svc"] = map[string]string{"cidr": a.svcCIDR6}
+		specData["svc"] = map[string]string{"cidr": a.svcCIDR6, "ns": pod.Namespace}
 	}
 	if a.gvproxyPath != "" {
 		// gvproxy's virtual network: 192.168.127.0/24, gateway+DNS at .1.

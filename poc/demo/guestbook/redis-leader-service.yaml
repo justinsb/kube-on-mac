@@ -1,0 +1,21 @@
+# SOURCE: https://cloud.google.com/kubernetes-engine/docs/tutorials/guestbook
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-leader
+  labels:
+    app: redis
+    role: leader
+    tier: backend
+spec:
+  # DIVERGENCE (PoC): the services data plane is IPv6-only (routed IPv6 pod
+  # networking); request an IPv6 ClusterIP (the apiserver allocates it, no
+  # controller-manager needed).
+  ipFamilies: [IPv6]
+  ports:
+  - port: 6379
+    targetPort: 6379
+  selector:
+    app: redis
+    role: leader
+    tier: backend
