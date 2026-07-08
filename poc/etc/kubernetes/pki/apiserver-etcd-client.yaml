@@ -1,0 +1,9 @@
+# The apiserver's client identity toward etcd (--etcd-certfile/--etcd-keyfile);
+# etcd runs with --client-cert-auth, so only holders of a CA-signed client
+# cert can touch the cluster's state.
+apiVersion: kube-on-macos.io/v1alpha1
+kind: Certificate
+spec:
+  issuerRef: pki/ca
+  commonName: kube-apiserver-etcd-client
+  usages: ["client auth"]

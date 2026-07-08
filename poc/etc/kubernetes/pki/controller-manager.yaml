@@ -1,0 +1,9 @@
+# kube-controller-manager's client identity: the built-in RBAC bindings for
+# the user `system:kube-controller-manager` grant exactly the controllers'
+# powers, nothing more.
+apiVersion: kube-on-macos.io/v1alpha1
+kind: Certificate
+spec:
+  issuerRef: pki/ca
+  commonName: system:kube-controller-manager
+  usages: ["client auth"]

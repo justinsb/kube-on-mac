@@ -1,0 +1,24 @@
+# kube-apiserver serving certificate. SANs cover every name a client uses:
+# - 127.0.0.1 / ::1  — the host-side gvproxy hostPort forward (kubectl, agent)
+# - fd42:6b75:6265:1::1 — the apiserver's bootstrap ClusterIP, which is also
+#   the address the allocator will hand the `kubernetes` Service when the v6
+#   range is primary (first address of the range): they converge on purpose.
+# - 10.96.0.1 — the v4 `kubernetes` ClusterIP (dual-stack setups)
+# - kubernetes.default.svc & friends — in-cluster DNS names
+apiVersion: kube-on-macos.io/v1alpha1
+kind: Certificate
+spec:
+  issuerRef: pki/ca
+  commonName: kube-apiserver
+  usages: ["server auth"]
+  dnsNames:
+    - kubernetes
+    - kubernetes.default
+    - kubernetes.default.svc
+    - kubernetes.default.svc.cluster.local
+    - localhost
+  ipAddresses:
+    - 127.0.0.1
+    - "::1"
+    - "fd42:6b75:6265:1::1"
+    - 10.96.0.1

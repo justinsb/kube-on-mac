@@ -1,0 +1,8 @@
+# The node agent is a host process: like kubectl, it uses the 127.0.0.1
+# forward rather than the VIP (the VIP data plane only exists inside pods).
+apiVersion: kube-on-macos.io/v1alpha1
+kind: Kubeconfig
+spec:
+  server: https://127.0.0.1:6443
+  certificateAuthorityRef: pki/ca
+  clientCertificateRef: pki/agent

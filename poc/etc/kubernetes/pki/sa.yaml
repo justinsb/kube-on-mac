@@ -1,0 +1,8 @@
+# ServiceAccount token signing keypair: the apiserver signs and verifies
+# (--service-account-signing-key-file / --service-account-key-file), the
+# controller-manager's token controller signs with the private half
+# (--service-account-private-key-file).
+apiVersion: kube-on-macos.io/v1alpha1
+kind: KeyPair
+spec:
+  algorithm: rsa2048

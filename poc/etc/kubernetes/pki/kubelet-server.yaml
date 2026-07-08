@@ -1,0 +1,11 @@
+# The agent's kubelet server (:10250) serving certificate — what the
+# apiserver verifies when proxying logs/exec. Replaces the self-signed cert
+# the agent generates today.
+apiVersion: kube-on-macos.io/v1alpha1
+kind: Certificate
+spec:
+  issuerRef: pki/ca
+  commonName: macos-poc
+  usages: ["server auth"]
+  dnsNames: [macos-poc, localhost]
+  ipAddresses: [127.0.0.1, "::1"]

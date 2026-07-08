@@ -41,6 +41,23 @@ hello-macos   1/1     Running   0          4s
 - `execd/` — the in-guest supervisor/exec daemon (Go, built static for
   linux/arm64 into `_artifacts/execd`; the agent clones it into each pod
   rootfs and `/entry.sh` execs it).
+- `pki/` — the declarative PKI reconciler: every certificate, keypair, and
+  kubeconfig is described by a YAML spec, and the generated material lives
+  alongside its spec (`apiserver.yaml` → `apiserver.crt` + `apiserver.key`).
+  `pki --dir etc/kubernetes` reconciles kubectl-apply style: missing →
+  created, matching → untouched, drifted (SAN edits, CA rotation, expiry) →
+  regenerated with the reason logged; a rotated CA cascades through every
+  child cert and kubeconfig automatically. Field names follow cert-manager
+  where they overlap.
+- `etc/kubernetes/` — the cluster's identity as commented, committed spec
+  files (the material itself is gitignored): cluster CA, apiserver serving
+  cert (SANs: 127.0.0.1 + bootstrap VIP + kubernetes.default.svc…), client
+  identities for admin / controller-manager / scheduler / the agent
+  (`system:node:`), etcd TLS (server + apiserver client), SA token keypair,
+  and the four kubeconfigs. Verified against real etcd: static pod with
+  `--client-cert-auth` on this material, reads/writes through the bootstrap
+  VIP with the client cert, rejected without. See
+  research/static-pod-control-plane.md for why each file exists.
 - `demo/pod.yaml` — example pod.
 - `_artifacts/` (gitignored) — libkrun.dylib + header, guest kernel, base
   Alpine rootfs, envtest binaries, kubeconfig, per-pod state

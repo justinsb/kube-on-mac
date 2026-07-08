@@ -1,0 +1,16 @@
+# etcd serving certificate. etcd traffic crosses the shared vmnet L2 (no
+# hostNetwork here — every pod is its own kernel), and etcd access is
+# cluster-admin-equivalent, so it gets TLS + client-cert auth rather than
+# the localhost-plaintext shortcut real control-plane hosts use.
+# fd42:6b75:6265:1::2 is etcd's bootstrap ClusterIP.
+apiVersion: kube-on-macos.io/v1alpha1
+kind: Certificate
+spec:
+  issuerRef: pki/ca
+  commonName: etcd
+  usages: ["server auth"]
+  dnsNames: [localhost]
+  ipAddresses:
+    - 127.0.0.1
+    - "::1"
+    - "fd42:6b75:6265:1::2"

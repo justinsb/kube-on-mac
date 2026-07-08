@@ -1,0 +1,10 @@
+# The cluster CA: the single trust root. The apiserver verifies client
+# certificates against it; every kubeconfig embeds ca.crt to verify the
+# apiserver. (Production clusters split etcd and front-proxy onto their own
+# CAs so one plane's compromise doesn't own the others; this PoC collapses
+# them into one and says so.)
+apiVersion: kube-on-macos.io/v1alpha1
+kind: Certificate
+spec:
+  isCA: true
+  commonName: kube-on-macos-ca

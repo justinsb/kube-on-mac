@@ -1,0 +1,10 @@
+# The apiserver's client identity when it dials the kubelet's :10250
+# (logs/exec/attach). Verifying this certificate is the natural first authn
+# on the agent's kubelet server, which today checks nothing.
+apiVersion: kube-on-macos.io/v1alpha1
+kind: Certificate
+spec:
+  issuerRef: pki/ca
+  commonName: kube-apiserver-kubelet-client
+  organizations: [system:masters]
+  usages: ["client auth"]

@@ -1,0 +1,11 @@
+# The node agent's client identity. The honest form is the node identity
+# (Node authorizer + NodeRestriction admission scope what a node may do);
+# the PoC starts there in name but the agent still uses admin powers for
+# its controller stand-ins — tightening this is tracked in the research note.
+apiVersion: kube-on-macos.io/v1alpha1
+kind: Certificate
+spec:
+  issuerRef: pki/ca
+  commonName: system:node:macos-poc
+  organizations: [system:nodes]
+  usages: ["client auth"]

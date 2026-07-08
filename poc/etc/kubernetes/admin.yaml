@@ -1,0 +1,8 @@
+# Admin kubeconfig: how kubectl on the host reaches the apiserver — via the
+# gvproxy hostPort forward at 127.0.0.1:6443, so no pod IP appears here.
+apiVersion: kube-on-macos.io/v1alpha1
+kind: Kubeconfig
+spec:
+  server: https://127.0.0.1:6443
+  certificateAuthorityRef: pki/ca
+  clientCertificateRef: pki/admin

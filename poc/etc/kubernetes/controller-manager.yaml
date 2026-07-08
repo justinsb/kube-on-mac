@@ -1,0 +1,8 @@
+# kube-controller-manager runs as a pod, so it reaches the apiserver through
+# the bootstrap ClusterIP — stable across apiserver restarts and upgrades.
+apiVersion: kube-on-macos.io/v1alpha1
+kind: Kubeconfig
+spec:
+  server: https://[fd42:6b75:6265:1::1]:6443
+  certificateAuthorityRef: pki/ca
+  clientCertificateRef: pki/controller-manager

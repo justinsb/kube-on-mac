@@ -1,0 +1,7 @@
+# kube-scheduler's client identity (user `system:kube-scheduler`).
+apiVersion: kube-on-macos.io/v1alpha1
+kind: Certificate
+spec:
+  issuerRef: pki/ca
+  commonName: system:kube-scheduler
+  usages: ["client auth"]

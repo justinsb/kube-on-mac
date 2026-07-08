@@ -1,0 +1,9 @@
+# Human superuser client certificate. RBAC group membership is literally the
+# O= field: system:masters bypasses RBAC entirely — the break-glass identity.
+apiVersion: kube-on-macos.io/v1alpha1
+kind: Certificate
+spec:
+  issuerRef: pki/ca
+  commonName: admin
+  organizations: [system:masters]
+  usages: ["client auth"]

@@ -177,6 +177,18 @@ Each step lands value on its own; the flip comes last.
    `https://127.0.0.1:6443` from the host, and both stay valid across
    control-plane upgrades (a manifest edit).
 4. **`pki` tool** replacing envtest's invisible cert machinery.
+   **DONE (2026-07-08), more declarative than sketched:** each cert/keypair/
+   kubeconfig is a YAML spec file with the generated material alongside it
+   (`apiserver.yaml` → `apiserver.crt` + `.key`), cert-manager field names,
+   reconciled kubectl-apply style — missing/matching/drifted, reasons
+   logged, CA rotation cascading through children and kubeconfigs. The full
+   inventory from this note now exists as commented specs in
+   `poc/etc/kubernetes/`; identities (CN/O) are read directly from the
+   files. Acceptance: real etcd as a static pod with `--client-cert-auth`
+   on the generated material — writes/reads through its bootstrap VIP with
+   the apiserver-etcd-client cert (proving the VIP SAN), rejected without a
+   client cert. ~550 lines including the Kubeconfig renderer; the "~200
+   legible lines" estimate held for the certificate core.
 5. **The flip**: control plane from official `registry.k8s.io` arm64 images
    via `manifests/`, then delete envtest and `agent/kcm.go`. kube-scheduler
    arrives here as a static pod on day one — it never needs a darwin build.
