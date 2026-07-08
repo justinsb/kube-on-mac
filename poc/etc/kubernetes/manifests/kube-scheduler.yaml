@@ -1,0 +1,22 @@
+# kube-scheduler — replaces the agent's bind-to-node stand-in loop.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-scheduler
+  namespace: kube-system
+  labels: { component: kube-scheduler, tier: control-plane }
+spec:
+  containers:
+    - name: kube-scheduler
+      image: registry.k8s.io/kube-scheduler:v1.33.0
+      command:
+        - kube-scheduler
+        - --kubeconfig=/etc/kubernetes/scheduler.kubeconfig
+        - --leader-elect=false
+      resources:
+        limits: { cpu: "1", memory: 256Mi }
+      volumeMounts:
+        - { name: etc-kubernetes, mountPath: /etc/kubernetes, readOnly: true }
+  volumes:
+    - name: etc-kubernetes
+      hostPath: { path: /Users/justinsb/projects/kube-on-macos/poc/etc/kubernetes, type: Directory }

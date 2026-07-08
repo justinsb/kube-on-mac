@@ -192,6 +192,56 @@ Each step lands value on its own; the flip comes last.
 5. **The flip**: control plane from official `registry.k8s.io` arm64 images
    via `manifests/`, then delete envtest and `agent/kcm.go`. kube-scheduler
    arrives here as a static pod on day one — it never needs a darwin build.
+   **DONE (2026-07-08).** The agent boots etcd → kube-apiserver → KCM +
+   kube-scheduler from `etc/kubernetes/manifests/` and joins the cluster it
+   just started. envtest, the darwin KCM build, and the bind-loop scheduler
+   stand-in are all deleted. Verified: full guestbook on the self-hosted
+   control plane (real scheduler binding, per-controller RBAC), and — the
+   payoff — **agent restarts resume the cluster** (deployments, services,
+   and running workloads all reappear from persistent etcd; only ephemeral
+   container state resets, as it should).
+
+## Findings from the flip
+
+Composing proven pieces still surfaced real bugs; recording them because
+each is a lesson about the boundaries between the pieces:
+
+- **Distroless images broke the boot shim.** Every pod was launched via
+  `/bin/sh /entry.sh`; the control-plane images have no shell. execd (a
+  static binary at the rootfs root) is now exec'd directly.
+- **The service data plane silently required the nftables kernel flag.**
+  With the default (non-nft) Kata kernel, the nftables netlink calls hang
+  rather than error. The nft kernel is now the agent default.
+- **VIP routability depended on router-advertisement timing.** VIP-bound
+  packets were only routable once the bridge's NAT66 RA installed a default
+  route — seconds after boot, too late for the apiserver's first etcd dial.
+  execd now installs an explicit on-link route for the service CIDR before
+  anything else runs.
+- **Conntrack poisoning: NAT is decided on a flow's first packet.** A
+  connection opened before the LB rules exist is never translated —
+  retransmits bypass the NAT chain and the flow black-holes for its whole
+  life. The LB setup is now synchronous, before the workload starts.
+  (This was invisible for a year of pods that didn't dial VIPs in their
+  first second.)
+- **Guest→host vsock dials can hang indefinitely** — observed persistently
+  in the kube-apiserver pod, not reproducible in identical test pods;
+  correlations with memory size and hostPorts both died under bisection.
+  OPEN INVESTIGATION (likely libkrun). Mitigations shipped: execd bounds
+  svc-channel dials at 3s (a wedged dial used to freeze the whole LB queue
+  behind a mutex), and the bootstrap-critical apiserver→etcd hop now uses
+  the node loopback path instead of the VIP: etcd publishes hostPort 2379
+  and the apiserver dials gvproxy's host gateway (192.168.127.254, added to
+  etcd's cert SANs) — the moral equivalent of real control planes using
+  localhost etcd, with no data-plane dependency.
+- **RBAC is real now, and it said no.** KCM as a single user may not create
+  ReplicaSets; the bootstrap bindings target per-controller ServiceAccounts,
+  activated by `--use-service-account-credentials=true` (why kubeadm sets
+  it).
+- **The node's InternalIP had to stop being 127.0.0.1** — the apiserver
+  *pod* dials the kubelet at that address for logs/exec; it is now gvproxy's
+  host gateway, and exec/logs work through it.
+- **Orphaned mirror pods** (static pod gone, mirror recovered from
+  persistent etcd) had no finalizer; the agent now completes their deletion.
 
 ## Measured: etcd's disk pattern over virtiofs (2026-07-08)
 

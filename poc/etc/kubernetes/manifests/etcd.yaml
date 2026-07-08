@@ -1,0 +1,40 @@
+# etcd: the cluster's only mutable state, on a persistent hostPath (agent
+# restarts now RESUME the cluster instead of erasing it). Client-cert TLS
+# because the flow crosses the shared vmnet L2 and etcd access is
+# cluster-admin-equivalent. fd42:6b75:6265:1::2 is its bootstrap ClusterIP —
+# resolved by the agent's static table, so the apiserver can dial it before
+# any apiserver exists.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: etcd
+  namespace: kube-system
+  labels: { component: etcd, tier: control-plane }
+  annotations:
+    kube-on-macos.io/cluster-ip: "fd42:6b75:6265:1::2"
+spec:
+  containers:
+    - name: etcd
+      image: registry.k8s.io/etcd:3.5.15-0
+      command:
+        - etcd
+        - --data-dir=/var/lib/etcd
+        - --cert-file=/etc/kubernetes/pki/etcd-server.crt
+        - --key-file=/etc/kubernetes/pki/etcd-server.key
+        - --client-cert-auth
+        - --trusted-ca-file=/etc/kubernetes/pki/ca.crt
+        - --listen-client-urls=https://[::]:2379
+        - --advertise-client-urls=https://[fd42:6b75:6265:1::2]:2379
+      ports:
+        - containerPort: 2379
+          hostPort: 2379
+      resources:
+        limits: { cpu: "1", memory: 512Mi }
+      volumeMounts:
+        - { name: etc-kubernetes, mountPath: /etc/kubernetes, readOnly: true }
+        - { name: data, mountPath: /var/lib/etcd }
+  volumes:
+    - name: etc-kubernetes
+      hostPath: { path: /Users/justinsb/projects/kube-on-macos/poc/etc/kubernetes, type: Directory }
+    - name: data
+      hostPath: { path: /Users/justinsb/projects/kube-on-macos/poc/_artifacts/etcd-data, type: DirectoryOrCreate }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
 	"github.com/mdlayher/vsock"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
@@ -84,10 +86,29 @@ type svcLB struct {
 	queryFn func(svcQuery) (svcAnswer, error)
 }
 
+// setupServiceLB must complete BEFORE the workload starts: conntrack decides
+// NAT once, on a flow's first packet, so a connection opened before these
+// rules exist is never translated — retransmits bypass the NAT chain and the
+// flow black-holes for its whole life. The kube-apiserver's very first etcd
+// dial (immediately at boot, one 20s attempt) hit exactly this.
 func setupServiceLB(cidr string) error {
 	_, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return fmt.Errorf("parsing service cidr: %w", err)
+	}
+	// Explicit on-link route for the service CIDR: without it, VIP-bound
+	// packets are only routable once the bridge's NAT66 router advertisement
+	// installs a default route — seconds after boot, which is too late for
+	// early dialers (the apiserver reaching etcd's VIP at startup). The
+	// packet only needs to survive the routing decision to hit our OUTPUT
+	// hook; after DNAT it re-routes to the real (on-link /64) pod address.
+	if link, err := netlink.LinkByName("eth1"); err == nil {
+		if err := netlink.RouteAdd(&netlink.Route{
+			LinkIndex: link.Attrs().Index,
+			Dst:       ipnet,
+		}); err != nil && !os.IsExist(err) {
+			log.Printf("adding service CIDR route: %v (continuing; RA may cover it)", err)
+		}
 	}
 	lb := &svcLB{
 		cidr:    ipnet,
@@ -295,7 +316,9 @@ func (lb *svcLB) serve(nf *nfqueue.Nfqueue) error {
 		return fmt.Errorf("registering nfqueue handler: %w", err)
 	}
 	log.Printf("service LB active (mark-based): queuing new flows to %s", lb.cidr)
-	select {}
+	// Verdicts run on the nfqueue library's goroutines; nothing to block on
+	// here. lb (and nf, via the callback closure) stay referenced.
+	return nil
 }
 
 // parseFlow extracts (dst ip6, dst port, proto) from an IPv6 packet with a
@@ -318,9 +341,33 @@ func parseFlow(pkt []byte) (vip string, port int, proto string, ok bool) {
 }
 
 func querySvcOverVsock(q svcQuery) (svcAnswer, error) {
-	conn, err := vsock.Dial(vsock.Host, svcVsockPort, nil)
-	if err != nil {
-		return svcAnswer{}, fmt.Errorf("dial host svc port: %w", err)
+	// vsock.Dial has no timeout and has been observed to hang indefinitely
+	// (guest-side, under investigation); a hung dial here would wedge the
+	// whole LB queue behind lb.mu. Bound it hard and let the caller's flow
+	// fail fast — dialers retry with fresh flows.
+	type dialResult struct {
+		conn *vsock.Conn
+		err  error
+	}
+	ch := make(chan dialResult, 1)
+	go func() {
+		c, err := vsock.Dial(vsock.Host, svcVsockPort, nil)
+		ch <- dialResult{c, err}
+	}()
+	var conn *vsock.Conn
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return svcAnswer{}, fmt.Errorf("dial host svc port: %w", r.err)
+		}
+		conn = r.conn
+	case <-time.After(3 * time.Second):
+		go func() { // reap a late-arriving connection
+			if r := <-ch; r.conn != nil {
+				r.conn.Close()
+			}
+		}()
+		return svcAnswer{}, fmt.Errorf("dial host svc port: timed out after 3s")
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))

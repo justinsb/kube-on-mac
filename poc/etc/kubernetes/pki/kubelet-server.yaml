@@ -8,4 +8,7 @@ spec:
   commonName: macos-poc
   usages: ["server auth"]
   dnsNames: [macos-poc, localhost]
-  ipAddresses: [127.0.0.1, "::1"]
+  # 192.168.127.254 is gvproxy's host address: how a pod (specifically the
+  # kube-apiserver pod, for logs/exec) reaches the macOS host — the node's
+  # registered InternalIP after the control-plane flip.
+  ipAddresses: [127.0.0.1, "::1", 192.168.127.254]

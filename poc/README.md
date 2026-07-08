@@ -17,7 +17,7 @@ What this demonstrates:
   design in [../research/macos-kubelet.md](../research/macos-kubelet.md).
 
 ```
-$ KUBECONFIG=poc/_artifacts/kubeconfig kubectl get nodes -o wide
+$ KUBECONFIG=poc/etc/kubernetes/admin.kubeconfig kubectl get nodes -o wide
 NAME        STATUS   ROLES    VERSION                  OS-IMAGE                                    KERNEL-VERSION   CONTAINER-RUNTIME
 macos-poc   Ready    <none>   kube-on-macos-poc-v0.1   Linux microVM (libkrun/HVF) on macOS host   6.12.28-kata     podvm://0.1
 
@@ -33,14 +33,19 @@ hello-macos   1/1     Running   0          4s
   window via `--dax-mb`), libkrun's built-in init execs the workload,
   stdout/stderr stream to the harness's stdio. Signed ad-hoc with the
   `com.apple.security.hypervisor` entitlement.
-- `agent/` — the PoC node agent (Go). Boots kube-apiserver + etcd locally
-  (envtest binaries) and a real kube-controller-manager, writes an admin
-  kubeconfig, registers the Node, heartbeats Ready (status + node Lease),
-  binds unassigned pods (stand-in for kube-scheduler), and reconciles bound
-  pods into `podvm` processes. One pod = one microVM.
+- `agent/` — the PoC node agent (Go), a kubelet stand-in. Boots the static
+  pods in `etc/kubernetes/manifests/` — which ARE the control plane: etcd,
+  kube-apiserver, kube-controller-manager, kube-scheduler, official
+  registry.k8s.io arm64 images, each in its own microVM — then joins the
+  cluster it just started (agent.kubeconfig via the apiserver pod's
+  127.0.0.1:6443 hostPort forward), registers the Node, heartbeats Ready
+  (status + node Lease), and reconciles scheduled pods into `podvm`
+  processes. One pod = one microVM. No envtest, no darwin control-plane
+  binaries, no bind-loop scheduler stand-in.
 - `execd/` — the in-guest supervisor/exec daemon (Go, built static for
   linux/arm64 into `_artifacts/execd`; the agent clones it into each pod
-  rootfs and `/entry.sh` execs it).
+  rootfs and libkrun's init execs it directly — no shell wrapper, so
+  distroless images work).
 - `pki/` — the declarative PKI reconciler: every certificate, keypair, and
   kubeconfig is described by a YAML spec, and the generated material lives
   alongside its spec (`apiserver.yaml` → `apiserver.crt` + `apiserver.key`).
@@ -89,29 +94,24 @@ Prereqs: Xcode CLT, Homebrew (`rustup`, `llvm`, `lld`, `xz`), Go.
 5. gvproxy (outbound pod networking): build from
    github.com/containers/gvisor-tap-vsock (`go build ./cmd/gvproxy`) into
    `_artifacts/gvproxy`.
-6. Envtest binaries:
-   `go run sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.21 use 1.33.0 --bin-dir _artifacts/envtest -p path`
-6. kube-controller-manager (envtest doesn't ship it; it's pure Go and builds
-   natively on macOS):
-   `git clone --depth 1 --branch v1.33.0 https://github.com/kubernetes/kubernetes`
-   then in that tree
-   `go build -o <poc>/_artifacts/kube-controller-manager ./cmd/kube-controller-manager`
-   (or `--kube-controller-manager=''` to run without it — Deployments etc.
-   will be inert).
-6. `cd agent && go build -o agent . && ./agent --assets ../_artifacts/envtest/k8s/1.33.0-darwin-arm64`
-7. In another shell:
-   `export KUBECONFIG=$PWD/_artifacts/kubeconfig; kubectl get nodes; kubectl apply -f demo/pod.yaml`
+6. execd: `cd execd && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../_artifacts/execd .`
+7. PKI + kubeconfigs (declarative; see `etc/kubernetes/`):
+   `cd pki && go build -o pki . && ./pki --dir ../etc/kubernetes`
+   Adjust the absolute hostPath paths in `etc/kubernetes/manifests/*.yaml`
+   for your checkout (PoC limitation).
+8. `cd agent && go build -o agent . && ./agent`
+   The agent boots the control plane from `etc/kubernetes/manifests/`
+   (official registry.k8s.io arm64 images, pulled on first boot) and joins
+   it. No envtest, no darwin control-plane binaries.
+9. In another shell:
+   `export KUBECONFIG=$PWD/etc/kubernetes/admin.kubeconfig; kubectl get nodes; kubectl apply -f demo/pod.yaml`
 
 Standalone harness smoke test (no Kubernetes):
 
 ```
 ./harness/podvm --kernel _artifacts/vmlinux-arm64 \
-    --rootfs _artifacts/rootfs-alpine -- /bin/sh /entry.sh
+    --rootfs _artifacts/rootfs-alpine -- /bin/sh -c 'echo hello from a microVM'
 ```
-
-(Workload argv travels as a script file in the rootfs: libkrun passes exec
-args over the kernel cmdline, which splits on whitespace. The production
-path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
 
 ## Honest accounting of what's faked
 
@@ -171,15 +171,19 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
   everything else forwards to gvproxy's resolver. `redis-server --replicaof
   redis-leader 6379` and PHP/Predis both just work (see
   docs/walkthrough.md). No headless-service endpoints, SRV, or pod records.
-- **The real kube-controller-manager runs** (built from the kubernetes tree
-  for darwin/arm64 — envtest doesn't ship it; the agent spawns and
-  supervises it, wired to envtest's service-account signing key). So
-  Deployments → ReplicaSets → pods, rolling updates (`kubectl rollout`),
-  EndpointSlices, garbage-collection cascades, namespace deletion, and
-  default-ServiceAccount creation are all the genuine articles; the agent
-  renews a node Lease (kubelet contract) so the node-lifecycle controller
-  stays happy. The full guestbook tutorial runs on this, rolling updates
-  included — see docs/walkthrough.md.
+- **The control plane is self-hosted: static pods from official images.**
+  etcd (persistent hostPath data dir — agent restarts RESUME the cluster,
+  verified with live state), kube-apiserver, kube-controller-manager
+  (`--use-service-account-credentials`, so per-controller RBAC is genuinely
+  enforced), and kube-scheduler (real pod binding) run from
+  `etc/kubernetes/manifests/` with PKI from the declarative specs alongside
+  them. In-cluster components reach the apiserver via its bootstrap
+  ClusterIP; host clients via 127.0.0.1:6443. apiserver→etcd uses the node
+  loopback path (etcd hostPort + gvproxy host gateway 192.168.127.254),
+  like real control planes use localhost etcd. The node's InternalIP is the
+  gvproxy host address so the apiserver *pod* can reach the kubelet server
+  for logs/exec. The full guestbook runs on this control plane; the cluster
+  and its workloads survive agent restarts.
 - **Partial kubelet server**: `kubectl logs` (with `-f`, `--tail`),
   `kubectl exec` (including `-it` with pty + resize + exit codes), and
   `kubectl attach` (so `kubectl run -it --image=debian:latest -- bash`
@@ -240,9 +244,11 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
   — the ServiceAccount token volume that admission injects into every pod is
   skipped, everything else unsupported fails the mount (pod stays Pending in
   FailedMount with backoff).
-- **Single container per pod**; control plane is envtest
-  apiserver+etcd plus a real kube-controller-manager; still no
-  kube-scheduler (the agent's bind-to-node loop stands in).
+- **Single container per pod.** Known data-plane caveat: an as-yet-undiagnosed
+  guest→host vsock dial hang was observed in the kube-apiserver pod
+  specifically (see research/static-pod-control-plane.md, "Findings from the
+  flip"); execd now bounds those dials at 3s so the LB cannot wedge, and the
+  bootstrap-critical apiserver→etcd hop avoids the VIP path entirely.
 
 ## Measured
 

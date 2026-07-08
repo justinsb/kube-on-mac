@@ -1,0 +1,28 @@
+# kube-controller-manager, dialing the apiserver's bootstrap ClusterIP —
+# stable across apiserver restarts and upgrades (a manifest edit).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-controller-manager
+  namespace: kube-system
+  labels: { component: kube-controller-manager, tier: control-plane }
+spec:
+  containers:
+    - name: kube-controller-manager
+      image: registry.k8s.io/kube-controller-manager:v1.33.0
+      command:
+        - kube-controller-manager
+        - --kubeconfig=/etc/kubernetes/controller-manager.kubeconfig
+        - --service-account-private-key-file=/etc/kubernetes/pki/sa.key
+        - --root-ca-file=/etc/kubernetes/pki/ca.crt
+        # Each controller runs as its own ServiceAccount (the bootstrap RBAC
+        # bindings target those, not the kube-controller-manager user).
+        - --use-service-account-credentials=true
+        - --leader-elect=false
+      resources:
+        limits: { cpu: "1", memory: 512Mi }
+      volumeMounts:
+        - { name: etc-kubernetes, mountPath: /etc/kubernetes, readOnly: true }
+  volumes:
+    - name: etc-kubernetes
+      hostPath: { path: /Users/justinsb/projects/kube-on-macos/poc/etc/kubernetes, type: Directory }

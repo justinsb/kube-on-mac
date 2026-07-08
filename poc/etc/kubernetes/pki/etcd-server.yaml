@@ -14,3 +14,7 @@ spec:
     - 127.0.0.1
     - "::1"
     - "fd42:6b75:6265:1::2"
+    # gvproxy's host gateway: the kube-apiserver pod dials etcd through the
+    # node loopback path (hostPort 2379), like real control planes use
+    # localhost etcd — no data-plane dependency in the bootstrap-critical hop.
+    - 192.168.127.254

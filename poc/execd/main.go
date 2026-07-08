@@ -328,7 +328,9 @@ func main() {
 		}
 	}
 	if sp.Svc != nil {
-		go func() {
+		// Synchronous on purpose: rules must exist before the workload's
+		// first connect, or early flows are never DNAT'd (see services.go).
+		func() {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("service LB panicked: %v (services unavailable, workload unaffected)", r)

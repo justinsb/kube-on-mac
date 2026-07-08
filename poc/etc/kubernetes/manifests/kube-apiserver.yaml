@@ -1,0 +1,50 @@
+# kube-apiserver. Reached three ways, none involving its pod IP:
+#   - host (kubectl, the agent): hostPort forward at 127.0.0.1:6443
+#   - pods (KCM, scheduler): bootstrap ClusterIP fd42:6b75:6265:1::1
+#   - later, kubernetes.default.svc via cluster DNS
+# Service CIDR: IPv4 primary (the apiserver's own bookkeeping — kubernetes
+# ClusterIP 10.96.0.1, v4 advertise address), IPv6 secondary for the
+# pod-reachable ClusterIPs the data plane serves. In-cluster access via the
+# v4 kubernetes.default VIP is not plumbed (the NFQUEUE data plane is
+# v6-only); components use explicit kubeconfigs with the v6 VIP instead.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-apiserver
+  namespace: kube-system
+  labels: { component: kube-apiserver, tier: control-plane }
+  annotations:
+    kube-on-macos.io/cluster-ip: "fd42:6b75:6265:1::1"
+spec:
+  containers:
+    - name: kube-apiserver
+      image: registry.k8s.io/kube-apiserver:v1.33.0
+      command:
+        - kube-apiserver
+        - --etcd-servers=https://192.168.127.254:2379
+        - --etcd-cafile=/etc/kubernetes/pki/ca.crt
+        - --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt
+        - --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key
+        - --tls-cert-file=/etc/kubernetes/pki/apiserver.crt
+        - --tls-private-key-file=/etc/kubernetes/pki/apiserver.key
+        - --client-ca-file=/etc/kubernetes/pki/ca.crt
+        - --service-account-key-file=/etc/kubernetes/pki/sa.pub
+        - --service-account-signing-key-file=/etc/kubernetes/pki/sa.key
+        - --service-account-issuer=https://kubernetes.default.svc.cluster.local
+        - --service-cluster-ip-range=10.96.0.0/16,fd42:6b75:6265:1::/112
+        - --advertise-address=192.168.127.2
+        - --authorization-mode=Node,RBAC
+        - --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt
+        - --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key
+        - --kubelet-preferred-address-types=InternalIP
+        - --secure-port=6443
+      ports:
+        - containerPort: 6443
+          hostPort: 6443
+      resources:
+        limits: { cpu: "1", memory: 512Mi }
+      volumeMounts:
+        - { name: etc-kubernetes, mountPath: /etc/kubernetes, readOnly: true }
+  volumes:
+    - name: etc-kubernetes
+      hostPath: { path: /Users/justinsb/projects/kube-on-macos/poc/etc/kubernetes, type: Directory }

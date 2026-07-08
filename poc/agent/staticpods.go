@@ -338,11 +338,15 @@ type errNotAPod string
 
 func (e errNotAPod) Error() string { return "not a pod manifest: " + string(e) }
 
-// uidFromHash formats the manifest hash as a UUID: deterministic, and
-// UUID-shaped because downstream consumers (vmnet-helper's interface id)
-// require one.
+// uidFromHash formats the manifest hash as a *valid* RFC-4122 UUID
+// (version 4, variant 10): deterministic, and well-formed because macOS's
+// vmnet framework silently fails to create an interface for a malformed
+// UUID — raw hash nibbles only work by luck.
 func uidFromHash(sum [32]byte) types.UID {
-	h := hex.EncodeToString(sum[:16])
+	b := sum[:16]
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(b)
 	return types.UID(h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32])
 }
 
