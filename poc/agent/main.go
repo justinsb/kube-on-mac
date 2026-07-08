@@ -147,12 +147,20 @@ type agent struct {
 	svcCIDR6    string
 	kubeletPort int
 
-	mu  sync.Mutex
-	vms map[types.UID]*podVM
+	mu         sync.Mutex
+	vms        map[types.UID]*podVM
+	staticVIPs map[string]*podVM // bootstrap ClusterIPs (static pod annotation) -> backend
 }
 
 // cs returns the API client, or nil before the apiserver is up.
 func (a *agent) cs() *kubernetes.Clientset { return a.client.Load() }
+
+// staticVIP looks up a bootstrap ClusterIP declared by a static pod.
+func (a *agent) staticVIP(vip string) *podVM {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.staticVIPs[vip]
+}
 
 func main() {
 	var (
@@ -197,6 +205,7 @@ func main() {
 		svcCIDR6:    *svcCIDR6,
 		kubeletPort: *kubeletPort,
 		vms:         map[types.UID]*podVM{},
+		staticVIPs:  map[string]*podVM{},
 	}
 	if err := os.MkdirAll(a.imagesDir, 0o755); err != nil {
 		log.Fatalf("creating images dir: %v", err)
@@ -653,7 +662,15 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			}
 			// -ssh-port -1 disables gvproxy's default 127.0.0.1:2222
 			// forward, which would collide across per-pod instances.
-			gvp = exec.Command(a.gvproxyPath, "-listen-vfkit", "unixgram://"+netSock, "-ssh-port", "-1")
+			gvArgs := []string{"-listen-vfkit", "unixgram://" + netSock, "-ssh-port", "-1"}
+			hostPorts := collectHostPorts(c)
+			apiSock := gvproxyAPISockPath(pod.UID)
+			if len(hostPorts) > 0 {
+				// The control API is only opened when needed (hostPorts).
+				os.Remove(apiSock)
+				gvArgs = append(gvArgs, "-listen", "unix://"+apiSock)
+			}
+			gvp = exec.Command(a.gvproxyPath, gvArgs...)
 			gvp.Stdout, gvp.Stderr = gvlog, gvlog
 			if err := gvp.Start(); err != nil {
 				logf.Close()
@@ -670,6 +687,17 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 					continue
 				}
 				return
+			}
+			if len(hostPorts) > 0 {
+				if err := exposeHostPorts(apiSock, hostPorts); err != nil {
+					gvp.Process.Kill()
+					logf.Close()
+					if retryStart(fmt.Errorf("hostPort forward: %w", err)) {
+						continue
+					}
+					return
+				}
+				log.Printf("pod %s/%s: hostPorts forwarded on 127.0.0.1: %v", pod.Namespace, pod.Name, hostPorts)
 			}
 			harnessArgs = append(harnessArgs, "--net-socket", netSock)
 		}

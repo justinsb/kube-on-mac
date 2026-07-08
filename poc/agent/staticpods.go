@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,11 +36,23 @@ const (
 	mirrorAnnotation = "kubernetes.io/config.mirror"
 	hashAnnotation   = "kubernetes.io/config.hash"
 	sourceAnnotation = "kubernetes.io/config.source"
+
+	// clusterIPAnnotation declares a bootstrap ClusterIP for a static pod:
+	// a stable VIP (inside the service CIDR, so the in-guest NFQUEUE data
+	// plane intercepts it) that the agent resolves to this pod from its own
+	// table — before, and independent of, any apiserver. This is the stable
+	// address that goes in control-plane kubeconfigs and cert SANs; the
+	// pod's real IP appears nowhere and may change freely across manifest
+	// edits. Once an apiserver is up, the VIP is claimed as a real Service
+	// (see syncMirrorService) so it is kubectl-visible and can't be
+	// allocated to anything else.
+	clusterIPAnnotation = "kube-on-macos.io/cluster-ip"
 )
 
 type staticPod struct {
 	file string
 	hash string // sha256 of the manifest file = the pod's internal UID
+	vip  string // bootstrap ClusterIP, "" if none
 	pod  *corev1.Pod
 	vm   *podVM
 }
@@ -118,10 +132,28 @@ func (a *agent) scanManifests(ctx context.Context, dir string, running map[strin
 			static:     true,
 			mirrorName: pod.Name + "-" + a.nodeName,
 		}
+		vip := pod.Annotations[clusterIPAnnotation]
+		if vip != "" {
+			if err := a.validateBootstrapVIP(vip); err != nil {
+				log.Printf("static pod %s: ignoring %s: %v", name, clusterIPAnnotation, err)
+				vip = ""
+			}
+		}
 		a.mu.Lock()
 		a.vms[pod.UID] = vm
+		if vip != "" {
+			if other, taken := a.staticVIPs[vip]; taken && other.podUID != pod.UID {
+				log.Printf("static pod %s: VIP %s already claimed by %s/%s; ignoring", name, vip, other.ns, other.name)
+				vip = ""
+			} else {
+				a.staticVIPs[vip] = vm
+			}
+		}
 		a.mu.Unlock()
-		running[name] = &staticPod{file: name, hash: hash, pod: pod, vm: vm}
+		if vip != "" {
+			log.Printf("static pod %s: bootstrap VIP %s -> %s/%s", name, vip, pod.Namespace, pod.Name)
+		}
+		running[name] = &staticPod{file: name, hash: hash, vip: vip, pod: pod, vm: vm}
 		log.Printf("static pod %s: starting %s/%s (uid %s)", name, pod.Namespace, pod.Name, pod.UID)
 		go a.runPod(ctx, pod, vm)
 	}
@@ -135,6 +167,19 @@ func (a *agent) scanManifests(ctx context.Context, dir string, running map[strin
 }
 
 func (a *agent) stopStaticPod(sp *staticPod) {
+	if sp.vip != "" {
+		a.mu.Lock()
+		if a.staticVIPs[sp.vip] == sp.vm {
+			delete(a.staticVIPs, sp.vip)
+		}
+		a.mu.Unlock()
+		// The Service claim dies with the manifest (best-effort; on a
+		// manifest *change* the new pod immediately re-claims it).
+		if client := a.cs(); client != nil {
+			client.CoreV1().Services(sp.pod.Namespace).Delete(context.Background(),
+				sp.pod.Name, metav1.DeleteOptions{})
+		}
+	}
 	sp.vm.stopOnce.Do(func() {
 		sp.vm.setStopping()
 		go a.killVM(sp.vm, podGracePeriod(sp.pod), "static pod manifest removed/changed")
@@ -149,12 +194,32 @@ func (a *agent) stopStaticPod(sp *staticPod) {
 	}
 }
 
+// validateBootstrapVIP: the VIP must be an IPv6 address inside the service
+// CIDR — that's what the guests' NFQUEUE rule intercepts.
+func (a *agent) validateBootstrapVIP(vip string) error {
+	addr, err := netip.ParseAddr(vip)
+	if err != nil {
+		return err
+	}
+	prefix, err := netip.ParsePrefix(a.svcCIDR6)
+	if err != nil {
+		return fmt.Errorf("bad service CIDR %q: %w", a.svcCIDR6, err)
+	}
+	if !addr.Is6() || !prefix.Contains(addr) {
+		return fmt.Errorf("%s is not inside the IPv6 service CIDR %s", vip, a.svcCIDR6)
+	}
+	return nil
+}
+
 // syncMirrorPods makes the API reflect the static pods: create missing
 // mirrors, replace stale ones, backfill status, and finish deletions the
 // user starts with kubectl (which must not touch the static pod itself).
 func (a *agent) syncMirrorPods(ctx context.Context, running map[string]*staticPod) {
 	client := a.cs()
 	for _, sp := range running {
+		if sp.vip != "" {
+			a.syncMirrorService(ctx, sp)
+		}
 		mirror, err := client.CoreV1().Pods(sp.pod.Namespace).Get(ctx, sp.vm.mirrorName, metav1.GetOptions{})
 		switch {
 		case apierrors.IsNotFound(err):
@@ -202,6 +267,54 @@ func (a *agent) createMirrorPod(ctx context.Context, sp *staticPod) {
 	if phase != "" {
 		a.setPhase(ctx, sp.pod, phase, reason, msg, cs)
 	}
+}
+
+// syncMirrorService claims a static pod's bootstrap VIP as a real Service
+// once an apiserver exists: kubectl-visible, and the ClusterIP allocator
+// can't hand the address to anything else. Resolution still happens from
+// the agent's own table (checked first), so the Service is a reflection,
+// not a dependency — same philosophy as mirror pods.
+func (a *agent) syncMirrorService(ctx context.Context, sp *staticPod) {
+	client := a.cs()
+	_, err := client.CoreV1().Services(sp.pod.Namespace).Get(ctx, sp.pod.Name, metav1.GetOptions{})
+	if err == nil || !apierrors.IsNotFound(err) {
+		return
+	}
+	var ports []corev1.ServicePort
+	for _, p := range sp.pod.Spec.Containers[0].Ports {
+		if p.ContainerPort != 0 {
+			ports = append(ports, corev1.ServicePort{
+				Name: p.Name, Port: p.ContainerPort, Protocol: corev1.ProtocolTCP,
+			})
+		}
+	}
+	if len(ports) == 0 {
+		log.Printf("static pod %s: VIP %s: no containerPorts declared; not creating mirror service", sp.file, sp.vip)
+		return
+	}
+	ipv6 := corev1.IPv6Protocol
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sp.pod.Name,
+			Namespace: sp.pod.Namespace,
+			Labels:    sp.pod.Labels,
+			Annotations: map[string]string{
+				sourceAnnotation: "file",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:  sp.vip,
+			ClusterIPs: []string{sp.vip},
+			IPFamilies: []corev1.IPFamily{ipv6},
+			Selector:   sp.pod.Labels,
+			Ports:      ports,
+		},
+	}
+	if _, err := client.CoreV1().Services(svc.Namespace).Create(ctx, svc, metav1.CreateOptions{}); err != nil {
+		log.Printf("static pod %s: claiming VIP %s as service %s/%s: %v", sp.file, sp.vip, svc.Namespace, svc.Name, err)
+		return
+	}
+	log.Printf("static pod %s: VIP %s claimed as service %s/%s", sp.file, sp.vip, svc.Namespace, svc.Name)
 }
 
 func parseStaticPod(data []byte) (*corev1.Pod, error) {

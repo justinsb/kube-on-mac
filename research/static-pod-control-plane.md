@@ -160,6 +160,22 @@ Each step lands value on its own; the flip comes last.
    stop. Start failures retry per restartPolicy — a static pod has no
    ReplicaSet to replace it, so a transient vmnet hiccup must not be fatal.
 3. **Pinned pod IPs** and the **gvproxy 6443 forward** (both small).
+   **DONE (2026-07-08), with a better design than pinning:** static pods
+   declare a **bootstrap ClusterIP** (`kube-on-macos.io/cluster-ip`, inside
+   the service CIDR so the NFQUEUE data plane intercepts it). The agent
+   answers VIP→pod from its own table — no apiserver involved, which breaks
+   the circularity that forces real clusters onto hostNetwork+nodeIP for
+   control-plane kubeconfigs. Pod IPs appear in no kubeconfig and no cert
+   SAN: verified by editing the manifest (pod IP changed, VIP constant,
+   clients unaffected). Once an apiserver exists the VIP is claimed as a
+   real Service (a reflection, not a dependency — mirror-pod philosophy;
+   deleting it costs nothing, it is re-claimed, and it dies with the
+   manifest). Host-side, `containers[].ports[].hostPort` is honored via
+   gvproxy's control API: 127.0.0.1:<hostPort> forwards into the pod, no
+   sudo, re-created with the pod — live before the apiserver was up. The
+   flip's kubeconfigs therefore use `https://[VIP]:6443` in-cluster and
+   `https://127.0.0.1:6443` from the host, and both stay valid across
+   control-plane upgrades (a manifest edit).
 4. **`pki` tool** replacing envtest's invisible cert machinery.
 5. **The flip**: control plane from official `registry.k8s.io` arm64 images
    via `manifests/`, then delete envtest and `agent/kcm.go`. kube-scheduler

@@ -89,6 +89,20 @@ func (a *agent) serveSvcConn(ctx context.Context, conn net.Conn) {
 // now writes real EndpointSlices; switching this to consume them instead of
 // re-deriving from selectors is a possible simplification.)
 func (a *agent) resolveService(ctx context.Context, q svcQuery) svcAnswer {
+	// Bootstrap ClusterIPs (static pod annotation) resolve from the agent's
+	// own table, apiserver or not — this is how control-plane clients will
+	// reach the apiserver VIP before (and while) the apiserver serves. Ports
+	// pass through 1:1.
+	if q.VIP != "" {
+		if vm := a.staticVIP(q.VIP); vm != nil {
+			ip := vm.getIP()
+			if ip == "" || vm.isStopping() {
+				return svcAnswer{Error: "bootstrap VIP backend not ready", TTLSeconds: 1}
+			}
+			log.Printf("static vip query [%s]:%d -> %s/%s (%s)", q.VIP, q.Port, vm.ns, vm.name, ip)
+			return svcAnswer{Endpoints: []string{ip}, TargetPort: q.Port, TTLSeconds: 5}
+		}
+	}
 	if a.cs() == nil {
 		// Static pods run before the apiserver; there are no services yet.
 		return svcAnswer{Error: "apiserver not available yet", TTLSeconds: 1}

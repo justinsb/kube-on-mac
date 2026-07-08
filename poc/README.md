@@ -199,6 +199,21 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
   (research/static-pod-control-plane.md). Start failures now retry per
   restartPolicy instead of failing the pod (kubelet semantics; nothing
   exists to replace a failed static pod).
+- **Bootstrap VIPs and hostPorts give static pods stable addresses.** A
+  static pod may declare `kube-on-macos.io/cluster-ip: <v6-in-svc-cidr>`:
+  the agent resolves that VIP to the pod from its own table — before, and
+  independent of, any apiserver (the NFQUEUE data plane needs only the
+  answer, and it takes precedence over API services). Once an apiserver
+  exists the VIP is claimed as a real Service (mirror-pod philosophy: a
+  reflection, not a dependency — deleting it changes nothing and it is
+  re-claimed; it dies with the manifest). Verified: clients ride a manifest
+  edit that changes the pod IP with zero configuration change — the VIP is
+  what goes in kubeconfigs and cert SANs, pod IPs appear nowhere.
+  `containers[].ports[].hostPort` is honored via each pod's gvproxy control
+  API: 127.0.0.1:<hostPort> on the macOS host forwards into the pod, no
+  sudo, re-created with the pod on restart (the future
+  127.0.0.1:6443 → apiserver path). Divergence: forwards bind 127.0.0.1
+  only, and hostPort is TCP-only.
 - **Volumes: hostPath and emptyDir only.** Each volume is its own virtio-fs
   share (readOnly enforced VMM-side and with MS_RDONLY in the guest);
   emptyDir lives under the pod state dir, surviving container restarts and
