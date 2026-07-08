@@ -89,6 +89,10 @@ func (a *agent) serveSvcConn(ctx context.Context, conn net.Conn) {
 // now writes real EndpointSlices; switching this to consume them instead of
 // re-deriving from selectors is a possible simplification.)
 func (a *agent) resolveService(ctx context.Context, q svcQuery) svcAnswer {
+	if a.cs() == nil {
+		// Static pods run before the apiserver; there are no services yet.
+		return svcAnswer{Error: "apiserver not available yet", TTLSeconds: 1}
+	}
 	if q.Name != "" {
 		return a.resolveServiceName(ctx, q)
 	}
@@ -96,7 +100,7 @@ func (a *agent) resolveService(ctx context.Context, q svcQuery) svcAnswer {
 	if proto == "" {
 		proto = "TCP"
 	}
-	svcs, err := a.client.CoreV1().Services(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	svcs, err := a.cs().CoreV1().Services(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return svcAnswer{Error: err.Error()}
 	}
@@ -128,7 +132,7 @@ func (a *agent) resolveService(ctx context.Context, q svcQuery) svcAnswer {
 			return svcAnswer{Error: "selector-less services not supported in PoC"}
 		}
 		sel := labels.SelectorFromSet(svc.Spec.Selector)
-		pods, err := a.client.CoreV1().Pods(svc.Namespace).List(ctx, metav1.ListOptions{
+		pods, err := a.cs().CoreV1().Pods(svc.Namespace).List(ctx, metav1.ListOptions{
 			LabelSelector: sel.String(),
 		})
 		if err != nil {
@@ -159,7 +163,7 @@ func (a *agent) resolveServiceName(ctx context.Context, q svcQuery) svcAnswer {
 	if ns == "" {
 		ns = "default"
 	}
-	svc, err := a.client.CoreV1().Services(ns).Get(ctx, q.Name, metav1.GetOptions{})
+	svc, err := a.cs().CoreV1().Services(ns).Get(ctx, q.Name, metav1.GetOptions{})
 	if err != nil {
 		return svcAnswer{Error: err.Error(), TTLSeconds: 5}
 	}

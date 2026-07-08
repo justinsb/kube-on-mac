@@ -257,7 +257,12 @@ func (a *agent) handleExec(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "expected /exec/{namespace}/{pod}/{container}", http.StatusNotFound)
 		return
 	}
-	pod, err := a.client.CoreV1().Pods(ns).Get(r.Context(), podName, metav1.GetOptions{})
+	client := a.cs()
+	if client == nil {
+		http.Error(w, "apiserver not available yet", http.StatusServiceUnavailable)
+		return
+	}
+	pod, err := client.CoreV1().Pods(ns).Get(r.Context(), podName, metav1.GetOptions{})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -268,7 +273,7 @@ func (a *agent) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cmd := r.URL.Query()["command"]
-	remotecommandserver.ServeExec(w, r, a, podName, pod.UID, container, cmd, streamOpts,
+	remotecommandserver.ServeExec(w, r, a, podName, podStateUID(pod), container, cmd, streamOpts,
 		time.Hour, 30*time.Second, remotecommandconsts.SupportedStreamingProtocols)
 }
 
@@ -278,7 +283,12 @@ func (a *agent) handleAttach(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "expected /attach/{namespace}/{pod}/{container}", http.StatusNotFound)
 		return
 	}
-	pod, err := a.client.CoreV1().Pods(ns).Get(r.Context(), podName, metav1.GetOptions{})
+	client := a.cs()
+	if client == nil {
+		http.Error(w, "apiserver not available yet", http.StatusServiceUnavailable)
+		return
+	}
+	pod, err := client.CoreV1().Pods(ns).Get(r.Context(), podName, metav1.GetOptions{})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -288,6 +298,6 @@ func (a *agent) handleAttach(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	remotecommandserver.ServeAttach(w, r, a, podName, pod.UID, container, streamOpts,
+	remotecommandserver.ServeAttach(w, r, a, podName, podStateUID(pod), container, streamOpts,
 		time.Hour, 30*time.Second, remotecommandconsts.SupportedStreamingProtocols)
 }

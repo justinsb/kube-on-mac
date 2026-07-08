@@ -186,6 +186,19 @@ path is the OCI-style `/.krun_config.json` that libkrun's init also reads.)
   `tty: true`), mirrors output to the console log, and serves exec/attach
   over vsock (guest port 1024 ↔ host unix socket in /tmp — sun_path is
   ~104 bytes on macOS, so the deep per-pod dir can't hold it).
+- **Static pods and mirror pods are real.** `--manifest-dir` (default
+  `_artifacts/manifests`) is watched: manifests start pods with *no
+  apiserver involved* — verified running before envtest finishes booting —
+  manifest edits restart them (a changed manifest is a different pod, fresh
+  deterministic UUID from the content hash), removals stop them. Once the
+  API is up each static pod gets a kubelet-style mirror pod
+  (`<name>-<node>`, `kubernetes.io/config.*` annotations) with live status;
+  logs/exec work through it, and deleting it never touches the static pod —
+  the file is the source of truth. This is the bootstrap primitive for
+  running the control plane itself as pods
+  (research/static-pod-control-plane.md). Start failures now retry per
+  restartPolicy instead of failing the pod (kubelet semantics; nothing
+  exists to replace a failed static pod).
 - **Volumes: hostPath and emptyDir only.** Each volume is its own virtio-fs
   share (readOnly enforced VMM-side and with MS_RDONLY in the guest);
   emptyDir lives under the pod state dir, surviving container restarts and

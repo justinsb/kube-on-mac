@@ -152,6 +152,13 @@ Each step lands value on its own; the flip comes last.
    threads exposed it. Fixed.)
 2. **Static pods + mirror pods** in the agent, proven with something
    trivial (a static nginx) before the control plane rides on it.
+   **DONE (2026-07-08):** manifest-dir watcher; pods verified running
+   *before* envtest's apiserver finished booting; kubelet-style mirror pods
+   (`<name>-<node>`, `config.mirror/hash/source` annotations, live status,
+   logs/exec); mirror deletion leaves the static pod untouched (same VM
+   pid); manifest edit = new pod (content-hash UUID), removal = graceful
+   stop. Start failures retry per restartPolicy — a static pod has no
+   ReplicaSet to replace it, so a transient vmnet hiccup must not be fatal.
 3. **Pinned pod IPs** and the **gvproxy 6443 forward** (both small).
 4. **`pki` tool** replacing envtest's invisible cert machinery.
 5. **The flip**: control plane from official `registry.k8s.io` arm64 images

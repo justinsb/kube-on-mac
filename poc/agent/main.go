@@ -10,9 +10,10 @@
 // logs/exec/attach via the :10250 kubelet server, startup/readiness/liveness
 // probes (exec + in-guest http/tcp via execd), graceful termination
 // (SIGTERM in the guest, SIGKILL after grace), restartPolicy with naive
-// crash backoff, hostPath/emptyDir volumes (per-volume virtio-fs shares).
-// Still missing: port-forward, configMap/secret/projected volumes,
-// authn/authz on the kubelet server.
+// crash backoff, hostPath/emptyDir volumes (per-volume virtio-fs shares),
+// static pods from a manifest dir (running before/without the apiserver)
+// with mirror pods. Still missing: port-forward, configMap/secret/projected
+// volumes, authn/authz on the kubelet server.
 package main
 
 import (
@@ -27,6 +28,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -45,6 +47,11 @@ type podVM struct {
 	name   string
 	ns     string
 
+	// Static pods (file-driven, no API object of their own) get a mirror
+	// pod named <name>-<node>; status writes go there when the API is up.
+	static     bool
+	mirrorName string
+
 	mu       sync.Mutex
 	cmd      *exec.Cmd
 	ready    bool
@@ -52,6 +59,13 @@ type podVM struct {
 	restarts int32
 	ip6      string
 	stopOnce sync.Once
+
+	// Last reported status, replayed onto the mirror pod when it is
+	// (re)created after the fact.
+	lastPhase  corev1.PodPhase
+	lastCS     *corev1.ContainerStatus
+	lastReason string
+	lastMsg    string
 }
 
 func (vm *podVM) setCmd(c *exec.Cmd) { vm.mu.Lock(); vm.cmd = c; vm.mu.Unlock() }
@@ -116,7 +130,10 @@ func podGracePeriod(pod *corev1.Pod) int64 {
 }
 
 type agent struct {
-	client      *kubernetes.Clientset
+	// client becomes non-nil once the apiserver is up. Static pods run
+	// before that (that's their point), so anything reachable from a static
+	// pod's lifecycle must handle a nil client.
+	client      atomic.Pointer[kubernetes.Clientset]
 	nodeName    string
 	harness     string
 	kernel      string
@@ -133,6 +150,9 @@ type agent struct {
 	mu  sync.Mutex
 	vms map[types.UID]*podVM
 }
+
+// cs returns the API client, or nil before the apiserver is up.
+func (a *agent) cs() *kubernetes.Clientset { return a.client.Load() }
 
 func main() {
 	var (
@@ -152,6 +172,7 @@ func main() {
 		kcmPath       = flag.String("kube-controller-manager", "../_artifacts/kube-controller-manager", "path to kube-controller-manager (darwin/arm64, built from the k8s tree; empty to disable — Deployments etc. will be inert)")
 		kubeconfigOut = flag.String("kubeconfig-out", "../_artifacts/kubeconfig", "where to write admin kubeconfig")
 		kubeletPort   = flag.Int("kubelet-port", 10250, "port for the kubelet server (kubectl logs)")
+		manifestDir   = flag.String("manifest-dir", "../_artifacts/manifests", "static pod manifest dir (watched; pods run without the apiserver; empty to disable)")
 	)
 	flag.Parse()
 
@@ -161,6 +182,54 @@ func main() {
 			log.Fatalf("abs %q: %v", *p, err)
 		}
 		*p = abs
+	}
+
+	a := &agent{
+		nodeName:    *nodeName,
+		harness:     *harness,
+		kernel:      *kernel,
+		rootfsBase:  *rootfsBase,
+		workDir:     *workDir,
+		imagesDir:   *imagesDir,
+		execdPath:   *execdPath,
+		gvproxyPath: *gvproxyPath,
+		vmnetHelper: *vmnetHelper,
+		svcCIDR6:    *svcCIDR6,
+		kubeletPort: *kubeletPort,
+		vms:         map[types.UID]*podVM{},
+	}
+	if err := os.MkdirAll(a.imagesDir, 0o755); err != nil {
+		log.Fatalf("creating images dir: %v", err)
+	}
+	if *vmnetHelper != "" {
+		prefix, err := netip.ParsePrefix(*podCIDR6)
+		if err != nil || prefix.Bits() != 64 || !prefix.Addr().Is6() {
+			log.Fatalf("--pod-cidr6 must be an IPv6 /64, got %q", *podCIDR6)
+		}
+		a.podCIDR6 = prefix
+		if _, err := os.Stat(*vmnetHelper); err != nil {
+			log.Fatalf("vmnet-helper not found at %s (brew install nirs/vmnet-helper/vmnet-helper, or --vmnet-helper='' to disable)", *vmnetHelper)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
+	go func() { <-sigc; log.Printf("shutting down"); cancel() }()
+
+	// Static pods start now — before the control plane exists. That ordering
+	// is the point: this is the primitive that will eventually boot the
+	// control plane itself (research/static-pod-control-plane.md).
+	if *manifestDir != "" {
+		dir, err := filepath.Abs(*manifestDir)
+		if err != nil {
+			log.Fatalf("abs %q: %v", *manifestDir, err)
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.Fatalf("creating manifest dir: %v", err)
+		}
+		go a.staticPodLoop(ctx, dir)
 	}
 
 	env := &envtest.Environment{}
@@ -200,40 +269,7 @@ func main() {
 	log.Printf("kubeconfig written to %s", *kubeconfigOut)
 	log.Printf("try: KUBECONFIG=%s kubectl get nodes", *kubeconfigOut)
 
-	a := &agent{
-		client:      kubernetes.NewForConfigOrDie(cfg),
-		nodeName:    *nodeName,
-		harness:     *harness,
-		kernel:      *kernel,
-		rootfsBase:  *rootfsBase,
-		workDir:     *workDir,
-		imagesDir:   *imagesDir,
-		execdPath:   *execdPath,
-		gvproxyPath: *gvproxyPath,
-		vmnetHelper: *vmnetHelper,
-		svcCIDR6:    *svcCIDR6,
-		kubeletPort: *kubeletPort,
-		vms:         map[types.UID]*podVM{},
-	}
-	if err := os.MkdirAll(a.imagesDir, 0o755); err != nil {
-		log.Fatalf("creating images dir: %v", err)
-	}
-	if *vmnetHelper != "" {
-		prefix, err := netip.ParsePrefix(*podCIDR6)
-		if err != nil || prefix.Bits() != 64 || !prefix.Addr().Is6() {
-			log.Fatalf("--pod-cidr6 must be an IPv6 /64, got %q", *podCIDR6)
-		}
-		a.podCIDR6 = prefix
-		if _, err := os.Stat(*vmnetHelper); err != nil {
-			log.Fatalf("vmnet-helper not found at %s (brew install nirs/vmnet-helper/vmnet-helper, or --vmnet-helper='' to disable)", *vmnetHelper)
-		}
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
-	go func() { <-sigc; log.Printf("shutting down"); cancel() }()
+	a.client.Store(kubernetes.NewForConfigOrDie(cfg))
 
 	if *kcmPath != "" {
 		p, err := filepath.Abs(*kcmPath)
@@ -283,15 +319,15 @@ func (a *agent) registerNode(ctx context.Context) error {
 			},
 		},
 	}
-	existing, err := a.client.CoreV1().Nodes().Get(ctx, a.nodeName, metav1.GetOptions{})
+	existing, err := a.cs().CoreV1().Nodes().Get(ctx, a.nodeName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		existing, err = a.client.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
+		existing, err = a.cs().CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
 	}
 	if err != nil {
 		return err
 	}
 	existing.Status = a.nodeStatus()
-	_, err = a.client.CoreV1().Nodes().UpdateStatus(ctx, existing, metav1.UpdateOptions{})
+	_, err = a.cs().CoreV1().Nodes().UpdateStatus(ctx, existing, metav1.UpdateOptions{})
 	return err
 }
 
@@ -342,12 +378,12 @@ func (a *agent) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			node, err := a.client.CoreV1().Nodes().Get(ctx, a.nodeName, metav1.GetOptions{})
+			node, err := a.cs().CoreV1().Nodes().Get(ctx, a.nodeName, metav1.GetOptions{})
 			if err != nil {
 				continue
 			}
 			node.Status = a.nodeStatus()
-			a.client.CoreV1().Nodes().UpdateStatus(ctx, node, metav1.UpdateOptions{})
+			a.cs().CoreV1().Nodes().UpdateStatus(ctx, node, metav1.UpdateOptions{})
 			a.renewNodeLease(ctx)
 		}
 	}
@@ -357,7 +393,7 @@ func (a *agent) heartbeatLoop(ctx context.Context) {
 // signal kube-controller-manager's node-lifecycle controller watches. Without
 // it the node would be marked NotReady and every pod taint-evicted.
 func (a *agent) renewNodeLease(ctx context.Context) {
-	leases := a.client.CoordinationV1().Leases(corev1.NamespaceNodeLease)
+	leases := a.cs().CoordinationV1().Leases(corev1.NamespaceNodeLease)
 	now := metav1.NewMicroTime(time.Now())
 	lease, err := leases.Get(ctx, a.nodeName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
@@ -389,7 +425,7 @@ func (a *agent) schedulerLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			pods, err := a.client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+			pods, err := a.cs().CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
 				FieldSelector: "spec.nodeName=",
 			})
 			if err != nil {
@@ -401,7 +437,7 @@ func (a *agent) schedulerLoop(ctx context.Context) {
 					ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID},
 					Target:     corev1.ObjectReference{Kind: "Node", Name: a.nodeName},
 				}
-				if err := a.client.CoreV1().Pods(pod.Namespace).Bind(ctx, b, metav1.CreateOptions{}); err == nil {
+				if err := a.cs().CoreV1().Pods(pod.Namespace).Bind(ctx, b, metav1.CreateOptions{}); err == nil {
 					log.Printf("bound pod %s/%s to %s", pod.Namespace, pod.Name, a.nodeName)
 				}
 			}
@@ -417,7 +453,7 @@ func (a *agent) reconcileLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			pods, err := a.client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+			pods, err := a.cs().CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
 				FieldSelector: "spec.nodeName=" + a.nodeName,
 			})
 			if err != nil {
@@ -431,6 +467,11 @@ func (a *agent) reconcileLoop(ctx context.Context) {
 }
 
 func (a *agent) reconcilePod(ctx context.Context, pod *corev1.Pod) {
+	if pod.Annotations[mirrorAnnotation] != "" {
+		// Mirror pods reflect static pods; their lifecycle belongs to the
+		// static pod manager, and starting a VM for one would double-run it.
+		return
+	}
 	a.mu.Lock()
 	vm, running := a.vms[pod.UID]
 	a.mu.Unlock()
@@ -439,7 +480,7 @@ func (a *agent) reconcilePod(ctx context.Context, pod *corev1.Pod) {
 		if !running {
 			// Nothing running (never started, or already exited): finalize.
 			zero := int64(0)
-			a.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
+			a.cs().CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
 				metav1.DeleteOptions{GracePeriodSeconds: &zero})
 			return
 		}
@@ -518,9 +559,7 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			}
 		}
 		if vm.isStopping() {
-			zero := int64(0)
-			a.client.CoreV1().Pods(pod.Namespace).Delete(context.Background(), pod.Name,
-				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+			a.finalizePod(pod, vm)
 			return
 		}
 	}
@@ -536,18 +575,56 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 	}
 
 	for attempt := 0; ; attempt++ {
+		// Start failures only consume the pod when restartPolicy is Never:
+		// kubelet semantics, and load-bearing for static pods — a transient
+		// host hiccup (a vmnet-helper EOF, say) must not permanently fail a
+		// pod that nothing exists to replace.
+		retryStart := func(err error) bool {
+			policy := pod.Spec.RestartPolicy
+			if policy == "" {
+				policy = corev1.RestartPolicyAlways
+			}
+			if policy == corev1.RestartPolicyNever {
+				fail("StartError", err)
+				return false
+			}
+			backoff := time.Duration(1<<min(attempt, 5)) * time.Second
+			log.Printf("pod %s/%s: StartError (retrying in %s): %v", pod.Namespace, pod.Name, backoff, err)
+			a.setPhase(ctx, pod, corev1.PodPending, "", "", &corev1.ContainerStatus{
+				Name:  c.Name,
+				Image: c.Image,
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{Reason: "StartError", Message: err.Error()},
+				},
+			})
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(backoff):
+			}
+			if vm.isStopping() {
+				a.finalizePod(pod, vm)
+				return false
+			}
+			return true
+		}
+
 		// Fresh container filesystem for every (re)start, matching kubelet
 		// semantics. The clone is an APFS clonefile copy, so this is cheap.
 		// (Volumes live outside the rootfs and persist across restarts.)
 		rootfs, err := a.makeRootfs(pod, dir, rootfsBase, mounts)
 		if err != nil {
-			fail("StartError", err)
+			if retryStart(err) {
+				continue
+			}
 			return
 		}
 		logf, err := os.OpenFile(filepath.Join(dir, "container.log"),
 			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
-			fail("StartError", err)
+			if retryStart(err) {
+				continue
+			}
 			return
 		}
 
@@ -569,7 +646,9 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			gvlog, err := os.Create(filepath.Join(dir, "gvproxy.log"))
 			if err != nil {
 				logf.Close()
-				fail("StartError", err)
+				if retryStart(err) {
+					continue
+				}
 				return
 			}
 			// -ssh-port -1 disables gvproxy's default 127.0.0.1:2222
@@ -579,13 +658,17 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			if err := gvp.Start(); err != nil {
 				logf.Close()
 				gvlog.Close()
-				fail("StartError", fmt.Errorf("starting gvproxy: %w", err))
+				if retryStart(fmt.Errorf("starting gvproxy: %w", err)) {
+					continue
+				}
 				return
 			}
 			if err := waitForSocket(netSock, 5*time.Second); err != nil {
 				gvp.Process.Kill()
 				logf.Close()
-				fail("StartError", err)
+				if retryStart(err) {
+					continue
+				}
 				return
 			}
 			harnessArgs = append(harnessArgs, "--net-socket", netSock)
@@ -604,7 +687,9 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 				if gvp != nil {
 					gvp.Process.Kill()
 				}
-				fail("StartError", err)
+				if retryStart(err) {
+					continue
+				}
 				return
 			}
 			vmnetCmd = vc
@@ -614,7 +699,9 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 				if gvp != nil {
 					gvp.Process.Kill()
 				}
-				fail("StartError", err)
+				if retryStart(err) {
+					continue
+				}
 				return
 			}
 			harnessArgs = append(harnessArgs, "--net2-socket", vmSock, "--net2-mac", mac)
@@ -629,7 +716,9 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 				if gvp != nil {
 					gvp.Process.Kill()
 				}
-				fail("StartError", err)
+				if retryStart(err) {
+					continue
+				}
 				return
 			}
 			defer stopSvc()
@@ -648,7 +737,9 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			if vmnetCmd != nil {
 				vmnetCmd.Process.Kill()
 			}
-			fail("StartError", err)
+			if retryStart(err) {
+				continue
+			}
 			return
 		}
 		vm.setCmd(cmd)
@@ -716,9 +807,7 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 				phase = corev1.PodFailed
 			}
 			a.setPhase(context.Background(), pod, phase, "", "", terminated)
-			zero := int64(0)
-			a.client.CoreV1().Pods(pod.Namespace).Delete(context.Background(), pod.Name,
-				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+			a.finalizePod(pod, vm)
 			return
 		}
 
@@ -758,12 +847,27 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 		case <-time.After(backoff):
 		}
 		if vm.isStopping() {
-			zero := int64(0)
-			a.client.CoreV1().Pods(pod.Namespace).Delete(context.Background(), pod.Name,
-				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+			a.finalizePod(pod, vm)
 			return
 		}
 	}
+}
+
+// finalizePod removes the pod's API presence after its VM is gone: the pod
+// object itself for API pods, the mirror pod for static pods (whose source
+// of truth is the manifest file, not the API).
+func (a *agent) finalizePod(pod *corev1.Pod, vm *podVM) {
+	client := a.cs()
+	if client == nil {
+		return
+	}
+	name := pod.Name
+	if vm.static {
+		name = vm.mirrorName
+	}
+	zero := int64(0)
+	client.CoreV1().Pods(pod.Namespace).Delete(context.Background(), name,
+		metav1.DeleteOptions{GracePeriodSeconds: &zero})
 }
 
 // preparePod does the once-per-pod work: pull the image, create the state
@@ -965,7 +1069,26 @@ func resolveVolumes(pod *corev1.Pod, stateDir string) (harnessArgs []string, mou
 }
 
 func (a *agent) setPhase(ctx context.Context, pod *corev1.Pod, phase corev1.PodPhase, reason, message string, cs *corev1.ContainerStatus) {
-	latest, err := a.client.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	a.mu.Lock()
+	vm := a.vms[pod.UID]
+	a.mu.Unlock()
+
+	name := pod.Name
+	if vm != nil && vm.static {
+		// Static pods have no API object of their own; status goes to the
+		// mirror pod. Record it on the VM too, so a mirror created later
+		// (or recreated after deletion) can be backfilled.
+		name = vm.mirrorName
+		vm.mu.Lock()
+		vm.lastPhase, vm.lastReason, vm.lastMsg = phase, reason, message
+		vm.lastCS = cs
+		vm.mu.Unlock()
+	}
+	client := a.cs()
+	if client == nil {
+		return // pre-apiserver (static pods only); mirror sync backfills later
+	}
+	latest, err := client.CoreV1().Pods(pod.Namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return
 	}
@@ -977,9 +1100,6 @@ func (a *agent) setPhase(ctx context.Context, pod *corev1.Pod, phase corev1.PodP
 		latest.Status.StartTime = &now
 	}
 	ready := corev1.ConditionFalse
-	a.mu.Lock()
-	vm := a.vms[pod.UID]
-	a.mu.Unlock()
 	if phase == corev1.PodRunning {
 		if vm == nil || vm.getReady() {
 			ready = corev1.ConditionTrue
@@ -997,7 +1117,7 @@ func (a *agent) setPhase(ctx context.Context, pod *corev1.Pod, phase corev1.PodP
 	if cs != nil {
 		latest.Status.ContainerStatuses = []corev1.ContainerStatus{*cs}
 	}
-	if _, err := a.client.CoreV1().Pods(pod.Namespace).UpdateStatus(ctx, latest, metav1.UpdateOptions{}); err != nil {
+	if _, err := a.cs().CoreV1().Pods(pod.Namespace).UpdateStatus(ctx, latest, metav1.UpdateOptions{}); err != nil {
 		log.Printf("updating status for %s/%s: %v", pod.Namespace, pod.Name, err)
 	}
 }

@@ -72,12 +72,18 @@ func (a *agent) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	ns, podName := parts[0], parts[1]
 
-	pod, err := a.client.CoreV1().Pods(ns).Get(r.Context(), podName, metav1.GetOptions{})
+	client := a.cs()
+	if client == nil {
+		http.Error(w, "apiserver not available yet", http.StatusServiceUnavailable)
+		return
+	}
+	pod, err := client.CoreV1().Pods(ns).Get(r.Context(), podName, metav1.GetOptions{})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	logPath := filepath.Join(a.workDir, string(pod.UID), "container.log")
+	uid := podStateUID(pod)
+	logPath := filepath.Join(a.workDir, string(uid), "container.log")
 	f, err := os.Open(logPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("no logs for pod %s/%s: %v", ns, podName, err), http.StatusNotFound)
@@ -114,7 +120,7 @@ func (a *agent) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			// Keep following until the VM is gone and we've drained.
-			if !a.vmRunning(pod.UID) {
+			if !a.vmRunning(uid) {
 				return
 			}
 			select {
