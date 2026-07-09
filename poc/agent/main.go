@@ -13,10 +13,11 @@
 // logs/exec/attach via the :10250 kubelet server, startup/readiness/liveness
 // probes (exec + in-guest http/tcp via execd), graceful termination
 // (SIGTERM in the guest, SIGKILL after grace), restartPolicy with naive
-// crash backoff, hostPath/emptyDir volumes (per-volume virtio-fs shares),
-// static pods from a manifest dir (running before/without the apiserver)
-// with mirror pods. Still missing: port-forward, configMap/secret/projected
-// volumes, authn/authz on the kubelet server.
+// crash backoff, hostPath/emptyDir/configMap/secret volumes (per-volume
+// virtio-fs shares; configMap/secret materialized at pod start), static
+// pods from a manifest dir (running before/without the apiserver) with
+// mirror pods. Still missing: port-forward, projected volumes,
+// authn/authz on the kubelet server.
 package main
 
 import (
@@ -512,7 +513,7 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 		dir, rootfsBase, err = a.preparePod(pod)
 		if err == nil {
 			reason = "FailedMount"
-			volArgs, mounts, err = resolveVolumes(pod, dir)
+			volArgs, mounts, err = a.resolveVolumes(ctx, pod, dir)
 		}
 		if err == nil {
 			break
@@ -997,17 +998,20 @@ type volumeMount struct {
 // restarts and dies with the pod — kubelet semantics). Projected volumes
 // (the auto-injected ServiceAccount token) are skipped quietly; anything
 // else is an error, matching a kubelet that can't set up a volume.
-func resolveVolumes(pod *corev1.Pod, stateDir string) (harnessArgs []string, mounts []volumeMount, err error) {
+func (a *agent) resolveVolumes(ctx context.Context, pod *corev1.Pod, stateDir string) (harnessArgs []string, mounts []volumeMount, err error) {
 	c := pod.Spec.Containers[0]
 	if len(c.VolumeMounts) == 0 {
 		return nil, nil, nil
 	}
+	static := pod.Annotations[sourceAnnotation] == "file"
 	byName := map[string]*corev1.Volume{}
 	for i := range pod.Spec.Volumes {
 		byName[pod.Spec.Volumes[i].Name] = &pod.Spec.Volumes[i]
 	}
 	// A volume's virtio-fs device is read-only only if every mount of it is.
+	// configMap/secret volumes are always read-only (kubelet semantics).
 	anyRW := map[string]bool{}
+	forceRO := map[string]bool{}
 	for _, m := range c.VolumeMounts {
 		if !m.ReadOnly {
 			anyRW[m.Name] = true
@@ -1051,20 +1055,38 @@ func resolveVolumes(pod *corev1.Pod, stateDir string) (harnessArgs []string, mou
 			if err := os.MkdirAll(hostDir, 0o755); err != nil {
 				return nil, nil, fmt.Errorf("emptyDir %q: %w", vol.Name, err)
 			}
+		case vol.ConfigMap != nil:
+			if static {
+				return nil, nil, fmt.Errorf("volume %q: static pods cannot reference API objects (configMap)", vol.Name)
+			}
+			hostDir = filepath.Join(stateDir, "volumes", vol.Name)
+			if err := a.materializeConfigMap(ctx, pod.Namespace, vol.ConfigMap, hostDir); err != nil {
+				return nil, nil, err
+			}
+			forceRO[vol.Name] = true
+		case vol.Secret != nil:
+			if static {
+				return nil, nil, fmt.Errorf("volume %q: static pods cannot reference API objects (secret)", vol.Name)
+			}
+			hostDir = filepath.Join(stateDir, "volumes", vol.Name)
+			if err := a.materializeSecret(ctx, pod.Namespace, vol.Secret, hostDir); err != nil {
+				return nil, nil, err
+			}
+			forceRO[vol.Name] = true
 		default:
-			return nil, nil, fmt.Errorf("volume %q: only hostPath and emptyDir are supported", vol.Name)
+			return nil, nil, fmt.Errorf("volume %q: unsupported volume type (hostPath, emptyDir, configMap, secret)", vol.Name)
 		}
 		tag, ok := tags[vol.Name]
 		if !ok {
 			tag = fmt.Sprintf("vol%d", len(tags))
 			tags[vol.Name] = tag
 			arg := tag + "=" + hostDir
-			if !anyRW[vol.Name] {
+			if !anyRW[vol.Name] || forceRO[vol.Name] {
 				arg += ":ro" // VMM-side enforcement; guest adds MS_RDONLY per mount
 			}
 			harnessArgs = append(harnessArgs, "--volume", arg)
 		}
-		mounts = append(mounts, volumeMount{Tag: tag, MountPath: m.MountPath, ReadOnly: m.ReadOnly})
+		mounts = append(mounts, volumeMount{Tag: tag, MountPath: m.MountPath, ReadOnly: m.ReadOnly || forceRO[vol.Name]})
 	}
 	return harnessArgs, mounts, nil
 }

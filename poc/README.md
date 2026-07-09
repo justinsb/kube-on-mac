@@ -235,15 +235,21 @@ Standalone harness smoke test (no Kubernetes):
   sudo, re-created with the pod on restart (the future
   127.0.0.1:6443 → apiserver path). Divergence: forwards bind 127.0.0.1
   only, and hostPort is TCP-only.
-- **Volumes: hostPath and emptyDir only.** Each volume is its own virtio-fs
-  share (readOnly enforced VMM-side and with MS_RDONLY in the guest);
-  emptyDir lives under the pod state dir, surviving container restarts and
-  dying with the pod. Verified with real etcd (official arm64 image) keeping
-  its data across pod deletion. hostPath types File/Socket/etc., subPath,
-  configMap/secret/downward/projected volumes, and PVCs are not implemented
-  — the ServiceAccount token volume that admission injects into every pod is
-  skipped, everything else unsupported fails the mount (pod stays Pending in
-  FailedMount with backoff).
+- **Volumes: hostPath, emptyDir, configMap, and secret.** Each volume is its
+  own virtio-fs share (readOnly enforced VMM-side and with MS_RDONLY in the
+  guest); emptyDir lives under the pod state dir, surviving container
+  restarts and dying with the pod. configMap/secret data is materialized to
+  host files at pod (re)start and mounted read-only, with `items`
+  projections, `defaultMode`/per-item modes, and `optional` honored — the
+  official "Configuring Redis using a ConfigMap" tutorial passes with its
+  manifest unmodified, including the update-configMap-and-recreate step.
+  Divergences: no live refresh after materialization (a restart
+  re-materializes) and secrets rest on the host filesystem, not tmpfs.
+  Static pods reject API-object volumes (kubelet contract). hostPath types
+  File/Socket/etc., subPath, downward/projected volumes, and PVCs are not
+  implemented — the ServiceAccount token volume that admission injects into
+  every pod is skipped, everything else unsupported fails the mount (pod
+  stays Pending in FailedMount with backoff).
 - **Single container per pod.**
 
 ## Measured
