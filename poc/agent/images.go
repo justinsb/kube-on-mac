@@ -2,10 +2,12 @@ package main
 
 import (
 	"archive/tar"
+
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/justinsb/kube-on-macos/poc/agent/erofs"
 	"io"
 	"log"
 	"os"
@@ -18,10 +20,16 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
-// ensureImage pulls (once) and flattens an OCI image for linux/arm64 into a
-// cached rootfs directory, returning its path. The image config is saved
-// alongside as <dir>.config.json so pods without an explicit command can use
-// the image's Entrypoint/Cmd.
+// ensureImage pulls (once) an OCI image for linux/arm64 and materializes it
+// into the cache, returning the cache path prefix. In block mode (the
+// default) the flattened tar stream is converted directly to <base>.erofs
+// by our own pure-Go EROFS writer (see the erofs package) — no temporary
+// directory, no external tools — which the harness attaches as a read-only
+// virtio-blk disk: a real Linux filesystem, so guests get case-sensitivity
+// and faithful ownership instead of APFS semantics, and all pods of an
+// image share one file (and the host page cache). In dir mode the legacy
+// flattened-directory path is used. Either way the image config lands at
+// <base>.config.json for Entrypoint/Cmd/env.
 func (a *agent) ensureImage(image string) (string, error) {
 	sum := sha256.Sum256([]byte(image))
 	safe := strings.Map(func(r rune) rune {
@@ -32,7 +40,11 @@ func (a *agent) ensureImage(image string) (string, error) {
 	}, strings.ToLower(image))
 	dir := filepath.Join(a.imagesDir, hex.EncodeToString(sum[:8])+"-"+safe)
 
-	if _, err := os.Stat(dir); err == nil {
+	if a.imageBlock {
+		if _, err := os.Stat(dir + ".erofs"); err == nil {
+			return dir, nil
+		}
+	} else if _, err := os.Stat(dir); err == nil {
 		return dir, nil
 	}
 
@@ -55,6 +67,35 @@ func (a *agent) ensureImage(image string) (string, error) {
 		}
 	}
 
+	if cf, err := img.ConfigFile(); err == nil {
+		if data, err := json.Marshal(cf); err == nil {
+			os.WriteFile(dir+".config.json", data, 0o644)
+		}
+	}
+
+	if a.imageBlock {
+		tmp := dir + ".erofs.tmp"
+		f, err := os.Create(tmp)
+		if err != nil {
+			return "", err
+		}
+		if err := erofs.Convert(mutate.Extract(img), f); err != nil {
+			f.Close()
+			os.Remove(tmp)
+			return "", fmt.Errorf("converting image to erofs: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			os.Remove(tmp)
+			return "", err
+		}
+		if err := os.Rename(tmp, dir+".erofs"); err != nil {
+			return "", err
+		}
+		st, _ := os.Stat(dir + ".erofs")
+		log.Printf("image %s ready at %s.erofs (%d MiB)", image, dir, st.Size()>>20)
+		return dir, nil
+	}
+
 	tmp := dir + ".tmp"
 	os.RemoveAll(tmp)
 	if err := os.MkdirAll(tmp, 0o755); err != nil {
@@ -70,12 +111,6 @@ func (a *agent) ensureImage(image string) (string, error) {
 		p := filepath.Join(tmp, d)
 		os.MkdirAll(p, 0o755)
 		os.Chmod(p, 0o777|os.ModeSticky)
-	}
-
-	if cf, err := img.ConfigFile(); err == nil {
-		if data, err := json.Marshal(cf); err == nil {
-			os.WriteFile(dir+".config.json", data, 0o644)
-		}
 	}
 	if err := os.Rename(tmp, dir); err != nil {
 		return "", err

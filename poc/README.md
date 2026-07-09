@@ -63,6 +63,8 @@ hello-macos   1/1     Running   0          4s
   `--client-cert-auth` on this material, reads/writes through the bootstrap
   VIP with the client cert, rejected without. See
   research/static-pod-control-plane.md for why each file exists.
+- `agent/erofs/` — pure-Go EROFS image writer (tar stream in, filesystem
+  image out; Linux v6.12 on-disk format, uncompressed, extended inodes).
 - `demo/pod.yaml` — example pod.
 - `_artifacts/` (gitignored) — libkrun.dylib + header, guest kernel, base
   Alpine rootfs, envtest binaries, kubeconfig, per-pod state
@@ -128,15 +130,19 @@ Standalone harness smoke test (no Kubernetes):
   Pull-by-digest of a non-arm64 image fails with an explicit architecture
   error; pull failures keep the pod Pending in `ErrImagePull` with doubling
   backoff (kubelet-style) instead of failing the pod.
-- **Host filesystem semantics leak into guests** (verified empirically):
-  the rootfs is a virtiofs share of an APFS directory, so guests see APFS
-  case-insensitivity (`/Foo` and `/foo` are the same file) and host
-  ownership (image files appear as the host user's uid, and guest `chown`
-  is not faithful). Workloads that depend on case-sensitivity or strict
-  ownership (postgres data dirs, sshd strict modes) can misbehave. Fix
-  (future work): serve the image as a real Linux filesystem in a block
-  image (EROFS/ext4 lower + writable upper), keeping virtiofs for
-  configMap/secret-style shares and DAX.
+- **Container filesystems are real Linux filesystems** (fixed 2026-07-09;
+  previously APFS-over-virtiofs leaked case-insensitivity and unfaithful
+  ownership into guests). Images are converted at pull time to EROFS by our
+  own pure-Go writer (`agent/erofs`, stdlib-only: streams the flattened tar
+  straight to the image — no temp dir, no mkfs.erofs) and attached as a
+  read-only virtio-blk disk; execd overlays a tmpfs upper and chroots the
+  workload in. Verified: `/Foo` and `/foo` are distinct, `chown` is
+  faithful, `/etc/shadow` is root:shadow 0640, and postgres — the old
+  poster child for the breakage — initdbs and serves. Every pod of an image
+  shares one file (and the host page cache); the tmpfs upper gives each
+  container start a fresh writable layer, matching the old re-clone
+  semantics. Volumes stay virtiofs by design. `--image-block=false`
+  restores the legacy flattened-dir mode.
 - **Pod networking: routed IPv6 pod IPs are real; services aren't yet.**
   Every pod VM has two NICs, both plumbed by execd via netlink (images
   can't be assumed to ship iproute2):

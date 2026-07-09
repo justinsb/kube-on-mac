@@ -74,14 +74,15 @@ type request struct {
 }
 
 type spec struct {
-	Argv   []string    `json:"argv"`
-	Env    []string    `json:"env,omitempty"` // image config env + pod spec env
-	Cwd    string      `json:"cwd,omitempty"`
-	TTY    bool        `json:"tty"`
-	Net    *netSpec    `json:"net,omitempty"`
-	Net6   *net6Spec   `json:"net6,omitempty"`
-	Svc    *svcSpec    `json:"svc,omitempty"`
-	Mounts []mountSpec `json:"mounts,omitempty"` // pod volumes (virtio-fs tags)
+	Argv    []string    `json:"argv"`
+	Env     []string    `json:"env,omitempty"` // image config env + pod spec env
+	Cwd     string      `json:"cwd,omitempty"`
+	RootDev string      `json:"rootDev,omitempty"` // block-image root (e.g. /dev/vda)
+	TTY     bool        `json:"tty"`
+	Net     *netSpec    `json:"net,omitempty"`
+	Net6    *net6Spec   `json:"net6,omitempty"`
+	Svc     *svcSpec    `json:"svc,omitempty"`
+	Mounts  []mountSpec `json:"mounts,omitempty"` // pod volumes (virtio-fs tags)
 }
 
 type mountSpec struct {
@@ -96,6 +97,7 @@ type mountSpec struct {
 // stuck in ContainerCreating; our equivalent is the VM exiting).
 func mountVolumes(mounts []mountSpec) {
 	for _, m := range mounts {
+		m.MountPath = rootPrefix + m.MountPath
 		if err := os.MkdirAll(m.MountPath, 0o755); err != nil {
 			fmt.Fprintf(os.Stderr, "execd: volume %s: mkdir %s: %v\n", m.Tag, m.MountPath, err)
 			log.Fatalf("volume %s: mkdir %s: %v", m.Tag, m.MountPath, err)
@@ -184,7 +186,7 @@ func configureNet(ns *netSpec) error {
 		return fmt.Errorf("adding default route: %w", err)
 	}
 	if ns.DNS != "" {
-		os.WriteFile("/etc/resolv.conf",
+		os.WriteFile(etcPath("resolv.conf"),
 			[]byte("nameserver "+ns.DNS+"\n"), 0o644)
 	}
 	return nil
@@ -320,6 +322,13 @@ func main() {
 		log.Fatalf("empty argv in spec")
 	}
 
+	if sp.RootDev != "" {
+		if err := setupBlockRoot(sp.RootDev); err != nil {
+			fmt.Fprintf(os.Stderr, "execd: block root: %v\n", err)
+			log.Fatalf("block root: %v", err)
+		}
+	}
+
 	if sp.Net != nil {
 		if err := configureNet(sp.Net); err != nil {
 			log.Printf("configuring network: %v (continuing without)", err)
@@ -362,7 +371,7 @@ func main() {
 				ns = "default"
 			}
 			search := fmt.Sprintf("%s.svc.cluster.local svc.cluster.local cluster.local", ns)
-			os.WriteFile("/etc/resolv.conf",
+			os.WriteFile(etcPath("resolv.conf"),
 				[]byte("nameserver 127.0.0.1\nsearch "+search+"\noptions ndots:5\n"), 0o644)
 			log.Printf("cluster dns up: 127.0.0.1:53 (search %s, upstream %s)", search, upstream)
 		}
@@ -376,8 +385,18 @@ func main() {
 	wl := &workload{}
 	cmd := exec.Command(sp.Argv[0], sp.Argv[1:]...)
 	cmd.Env = workloadEnv()
+	if rootPrefix != "" {
+		path, err := lookPathInRoot(rootPrefix, cmd.Env, sp.Argv[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "execd: %v\n", err)
+			log.Fatalf("%v", err)
+		}
+		cmd.Path = path
+		cmd.Err = nil // clear any LookPath error from exec.Command
+		cmd.SysProcAttr = &syscall.SysProcAttr{Chroot: rootPrefix}
+	}
 	if sp.Cwd != "" {
-		os.MkdirAll(sp.Cwd, 0o755) // images may declare a WORKDIR the tar lacks
+		os.MkdirAll(rootPrefix+sp.Cwd, 0o755) // images may declare a WORKDIR the tar lacks
 		cmd.Dir = sp.Cwd
 		workloadCwd = sp.Cwd
 	}
@@ -564,6 +583,16 @@ func handleExec(fc *framedConn, req request) {
 	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
 	cmd.Env = workloadEnv()
 	cmd.Dir = workloadCwd
+	if rootPrefix != "" {
+		path, err := lookPathInRoot(rootPrefix, cmd.Env, req.Argv[0])
+		if err != nil {
+			fc.writeFrame(frameExit, []byte(fmt.Sprintf(`{"code":126,"error":%q}`, err.Error())))
+			return
+		}
+		cmd.Path = path
+		cmd.Err = nil
+		cmd.SysProcAttr = &syscall.SysProcAttr{Chroot: rootPrefix}
+	}
 
 	var ptyF *os.File
 	var stdinW io.WriteCloser

@@ -154,6 +154,7 @@ type agent struct {
 	kubeletCert string
 	kubeletKey  string
 	clientCA    string
+	imageBlock  bool
 
 	mu         sync.Mutex
 	vms        map[types.UID]*podVM
@@ -190,6 +191,7 @@ func main() {
 		kubeletKey    = flag.String("kubelet-key", "../etc/kubernetes/pki/kubelet-server.key", "kubelet server TLS key")
 		clientCA      = flag.String("client-ca", "../etc/kubernetes/pki/ca.crt", "CA bundle for verifying kubelet API clients (the apiserver)")
 		manifestDir   = flag.String("manifest-dir", "../etc/kubernetes/manifests", "static pod manifest dir (watched; pods run without the apiserver — the control plane itself lives here; empty to disable)")
+		imageBlock    = flag.Bool("image-block", true, "serve images as read-only ext4 block devices with a tmpfs overlay (real Linux fs semantics); false = legacy flattened-dir virtiofs root")
 	)
 	flag.Parse()
 
@@ -217,6 +219,7 @@ func main() {
 		kubeletCert: *kubeletCert,
 		kubeletKey:  *kubeletKey,
 		clientCA:    *clientCA,
+		imageBlock:  *imageBlock,
 		vms:         map[types.UID]*podVM{},
 		staticVIPs:  map[string]*podVM{},
 	}
@@ -629,6 +632,9 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			"--vsock-exec", execSockPath(pod.UID),
 		}
 		harnessArgs = append(harnessArgs, volArgs...)
+		if a.imageBlock {
+			harnessArgs = append(harnessArgs, "--root-image", rootfsBase+".erofs")
+		}
 		var gvp *exec.Cmd
 		if a.gvproxyPath != "" {
 			netSock := netSockPath(pod.UID)
@@ -905,8 +911,11 @@ func (a *agent) preparePod(pod *corev1.Pod) (string, string, error) {
 	return dir, rootfsBase, nil
 }
 
-// makeRootfs materializes a fresh container filesystem from the image base,
-// discarding any previous one, and installs execd + the workload spec.
+// makeRootfs materializes the guest boot filesystem. In block mode this is
+// a tiny staging dir — just execd, the spec, and mountpoint dirs — because
+// the image itself arrives as a read-only virtio-blk ext4 that execd
+// overlays (tmpfs upper) and chroots the workload into. In dir mode it is
+// the legacy APFS clone of the flattened image.
 func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string, mounts []volumeMount) (string, error) {
 	c := pod.Spec.Containers[0]
 	rootfs := filepath.Join(dir, "rootfs")
@@ -920,11 +929,20 @@ func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string, mounts []vol
 			}
 		}
 	}
-	// APFS clonefile copy of the base rootfs: instant, copy-on-write.
-	// -p matters: without it, directories are recreated subject to the
-	// umask, silently stripping e.g. /tmp's 1777 down to 1755.
-	if out, err := exec.Command("/bin/cp", "-Rpc", rootfsBase, rootfs).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("cloning rootfs: %v: %s", err, out)
+	if a.imageBlock {
+		// Boot dir: execd + spec + the dirs libkrun's init and execd expect.
+		for _, d := range []string{"", "dev", "proc", "sys", "newroot", "lower", "rw"} {
+			if err := os.MkdirAll(filepath.Join(rootfs, d), 0o755); err != nil {
+				return "", err
+			}
+		}
+	} else {
+		// APFS clonefile copy of the base rootfs: instant, copy-on-write.
+		// -p matters: without it, directories are recreated subject to the
+		// umask, silently stripping e.g. /tmp's 1777 down to 1755.
+		if out, err := exec.Command("/bin/cp", "-Rpc", rootfsBase, rootfs).CombinedOutput(); err != nil {
+			return "", fmt.Errorf("cloning rootfs: %v: %s", err, out)
+		}
 	}
 
 	// The guest boots into execd, which supervises the workload (on a pty
@@ -942,6 +960,9 @@ func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string, mounts []vol
 		return "", fmt.Errorf("no command: pod spec has none and image config has no Entrypoint/Cmd")
 	}
 	specData := map[string]any{"argv": argv, "tty": c.TTY}
+	if a.imageBlock {
+		specData["rootDev"] = "/dev/vda"
+	}
 	// Environment: image config env, overridden by pod spec env. valueFrom
 	// (fieldRef/configMap/secret) is not implemented.
 	env := imageEnv(rootfsBase)

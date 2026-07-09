@@ -54,6 +54,7 @@ int main(int argc, char *const argv[])
     const char *net_socket_path = NULL;
     const char *net2_socket_path = NULL;
     const char *net2_mac = NULL;
+    const char *root_image = NULL;
     long cpus = 1;
     long mem_mib = 256;
     long dax_mib = 0;
@@ -76,12 +77,13 @@ int main(int argc, char *const argv[])
         { "net2-socket", required_argument, NULL, 'N' },
         { "net2-mac", required_argument, NULL, 'M' },
         { "volume", required_argument, NULL, 'v' },
+        { "root-image", required_argument, NULL, 'R' },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "+k:r:c:m:d:l:x:S:n:N:M:v:h", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "+k:r:c:m:d:l:x:S:n:N:M:v:R:h", opts, NULL)) != -1) {
         switch (c) {
         case 'k': kernel_path = optarg; break;
         case 'r': rootfs = optarg; break;
@@ -116,6 +118,7 @@ int main(int argc, char *const argv[])
             n_volumes++;
             break;
         }
+        case 'R': root_image = optarg; break;
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 1;
         }
@@ -183,6 +186,15 @@ int main(int argc, char *const argv[])
                                  (uint64_t)dax_mib * 1024 * 1024, false),
               "krun_add_virtiofs3"))
         return 1;
+
+    /* The image as a read-only raw ext4 block device (shared across every
+     * pod of the image — one file, one host page cache). execd overlays a
+     * tmpfs upper on it and chroots the workload in. */
+    if (root_image != NULL) {
+        if (check(krun_add_disk(ctx, "root", root_image, true),
+                  "krun_add_disk"))
+            return 1;
+    }
 
     /* Pod volumes: one additional virtio-fs device per volume; execd mounts
      * them by tag at the declared mountPaths. read-only is enforced VMM-side
