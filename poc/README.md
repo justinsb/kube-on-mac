@@ -122,9 +122,19 @@ Standalone harness smoke test (no Kubernetes):
 ## Honest accounting of what's faked
 
 - **Image pull is real but flat**: images are pulled for linux/arm64 (via
-  go-containerregistry), flattened to a rootfs dir, and cached under
-  `_artifacts/images/`; pods get APFS clones. No layer store, no
-  imagePullSecrets, anonymous registry auth only. Pods with no command use
+  go-containerregistry) and flattened in a single streaming pass — no temp
+  directory, no per-layer staging. go-containerregistry's `mutate.Extract`
+  merges the layers newest-first with a seen-paths set (a lower-layer file
+  that was overwritten or whiteout'd above is skipped without copying; no
+  sorted-order requirement on the tars), and the surviving bytes stream
+  straight into the EROFS writer, written to disk exactly once. Each layer
+  is still downloaded and decompressed once — unavoidable. The real cost of
+  flattening is cross-image: shared base layers are stored again inside
+  every image's `.erofs`. Future work: one EROFS per layer, cached by layer
+  digest, attached as stacked read-only disks with the guest mounting
+  `overlay(lowerdir=layerN:…:layer1)` — snapshotter-style dedup expressed
+  as block devices (the composefs direction). No imagePullSecrets,
+  anonymous registry auth only. Pods with no command use
   the image's Entrypoint/Cmd; image env vars and WorkingDir are honored (pod
   spec `env`/`workingDir` override them; `env.valueFrom` is not implemented).
   Pull-by-digest of a non-arm64 image fails with an explicit architecture
