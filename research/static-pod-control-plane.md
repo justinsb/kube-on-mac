@@ -294,6 +294,27 @@ trade, and it isn't a virtiofs limitation — it's the host OS contract.
   in the inventory) vs delegated TokenReview (real, later).
 - Cert rotation/renewal: out of scope — these are dev artifacts;
   regenerate = rerun the tool. Note it as the gap it is.
-- Upgrades: a version bump is editing the image tag in a manifest file —
-  worth demonstrating explicitly once this lands (it's the anti-kubeadm
-  upgrade story).
+- ~~Upgrades: a version bump is editing the image tag in a manifest file —
+  worth demonstrating explicitly once this lands.~~ **DONE (2026-07-09),
+  measured — the pure-declarative upgrade story.** v1.33.0 → v1.33.13, the
+  entire operation was editing one image tag in each of three manifest
+  files, applied kubeadm-order (apiserver, then KCM + scheduler), each
+  edit restarting its static pod on the new image:
+
+  - **64 seconds** from first edit to all three components serving
+    v1.33.13, image pulls included (apiserver alone: 35s edit-to-serving).
+  - API outage: **33s** (one apiserver pod; an HA setup would roll).
+  - Workload pods: zero restarts, established connections unaffected.
+  - Honest finding: **16 of 197 guestbook probes failed during the API
+    window** — not because workloads depend on the control plane, but
+    because the PHP frontend resolves `redis-follower` per request and the
+    lazy DNS resolver consults the apiserver on cache miss (5s TTL).
+    Hardening noted below. Rollback is the same edit in reverse: the
+    desired version lives in a file, nowhere else.
+  - The upgraded controllers were exercised immediately (scale up/down:
+    ReplicaSet grew, the new scheduler bound the pod, Running in 21s).
+- Lazy-resolution hardening: the execd DNS/service resolver should serve
+  stale answers when the apiserver is unreachable (CoreDNS effectively
+  does this by owning a watch-fed cache). Today an apiserver outage
+  degrades *new* name lookups after the 5s TTL; existing flows are
+  untouched.

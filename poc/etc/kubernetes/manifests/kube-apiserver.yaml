@@ -18,7 +18,7 @@ metadata:
 spec:
   containers:
     - name: kube-apiserver
-      image: registry.k8s.io/kube-apiserver:v1.33.0
+      image: registry.k8s.io/kube-apiserver:v1.33.13
       command:
         - kube-apiserver
         - --etcd-servers=https://[fd42:6b75:6265:1::2]:2379
