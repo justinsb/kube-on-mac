@@ -232,14 +232,14 @@ func (a *agent) execdRequest(uid types.UID, req map[string]any, timeout time.Dur
 func (a *agent) ExecInContainer(ctx context.Context, name string, uid types.UID, container string,
 	cmd []string, in io.Reader, out, errw io.WriteCloser, tty bool,
 	resize <-chan remotecommand.TerminalSize, timeout time.Duration) error {
-	return a.session(ctx, uid, map[string]any{"op": "exec", "argv": cmd, "tty": tty}, in, out, errw, resize)
+	return a.session(ctx, uid, map[string]any{"op": "exec", "container": container, "argv": cmd, "tty": tty}, in, out, errw, resize)
 }
 
 // AttachContainer implements the kubelet streaming Attacher interface.
 func (a *agent) AttachContainer(ctx context.Context, name string, uid types.UID, container string,
 	in io.Reader, out, errw io.WriteCloser, tty bool,
 	resize <-chan remotecommand.TerminalSize) error {
-	return a.session(ctx, uid, map[string]any{"op": "attach"}, in, out, errw, resize)
+	return a.session(ctx, uid, map[string]any{"op": "attach", "container": container}, in, out, errw, resize)
 }
 
 // splitStreamPath parses /exec/{ns}/{pod}/{container} (or /attach/...).

@@ -32,15 +32,17 @@ func gvproxyAPISockPath(uid types.UID) string {
 	return filepath.Join("/tmp", "podvm-"+short+".gvapi")
 }
 
-func collectHostPorts(c corev1.Container) [][2]int32 {
+func collectHostPorts(pod *corev1.Pod) [][2]int32 {
 	var out [][2]int32
-	for _, p := range c.Ports {
-		if p.HostPort != 0 && (p.Protocol == "" || p.Protocol == corev1.ProtocolTCP) {
-			cp := p.ContainerPort
-			if cp == 0 {
-				cp = p.HostPort
+	for _, c := range pod.Spec.Containers {
+		for _, p := range c.Ports {
+			if p.HostPort != 0 && (p.Protocol == "" || p.Protocol == corev1.ProtocolTCP) {
+				cp := p.ContainerPort
+				if cp == 0 {
+					cp = p.HostPort
+				}
+				out = append(out, [2]int32{p.HostPort, cp})
 			}
-			out = append(out, [2]int32{p.HostPort, cp})
 		}
 	}
 	return out

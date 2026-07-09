@@ -277,10 +277,11 @@ func (a *agent) createMirrorPod(ctx context.Context, sp *staticPod) {
 	// Backfill the status reported before the mirror existed (e.g. the pod
 	// went Running while the apiserver was still booting).
 	sp.vm.mu.Lock()
-	phase, reason, msg, cs := sp.vm.lastPhase, sp.vm.lastReason, sp.vm.lastMsg, sp.vm.lastCS
+	phase, reason, msg := sp.vm.lastPhase, sp.vm.lastReason, sp.vm.lastMsg
+	ics, cs := sp.vm.lastICS, sp.vm.lastCS
 	sp.vm.mu.Unlock()
 	if phase != "" {
-		a.setPhase(ctx, sp.pod, phase, reason, msg, cs)
+		a.setPhase(ctx, sp.pod, phase, reason, msg, ics, cs)
 	}
 }
 

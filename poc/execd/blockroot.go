@@ -9,71 +9,120 @@ import (
 	"syscall"
 )
 
-// Block-image roots: the container image arrives as a read-only virtio-blk
-// ext4 (a real Linux filesystem — case-sensitive, faithful ownership, real
-// xattrs — unlike a virtiofs view of APFS). execd assembles
+// Block-image container roots: each container's image arrives as its own
+// read-only virtio-blk EROFS (containers sharing an image share the disk).
+// Per container, execd assembles
 //
-//	/dev/vda (ext4, ro)  ->  /lower
-//	tmpfs                ->  /rw   (upper+work)
-//	overlay(lower,upper) ->  /newroot
+//	/dev/vdX (erofs, ro)      ->  /lower-vdX      (shared per image)
+//	tmpfs                     ->  /rw-<name>      (upper+work)
+//	overlay(lower,upper)      ->  /roots/<name>   (the chroot)
 //
-// and chroots the workload (and exec sessions) into /newroot. The tmpfs
-// upper gives every container start a fresh writable layer, which is the
-// same contract the per-restart rootfs re-clone provided. execd itself
-// stays in the tiny virtiofs boot root, next to its vsock/console plumbing.
+// plus the kernel filesystems the workload expects (proc, sysfs, devtmpfs,
+// devpts) and a pod-shared /dev/shm — one tmpfs bind-mounted into every
+// container, because containers in a pod share IPC.
 
-// rootPrefix is "" in legacy dir mode, "/newroot" in block mode.
-var rootPrefix string
+var (
+	mountedLowers = map[string]string{} // device -> lower dir
+	builtRoots    []string             // every container root (for /etc writes)
+	podShmReady   bool
+)
 
-func setupBlockRoot(dev string) error {
-	// libkrun's init normally provides /dev; make sure it exists so the
-	// block device node is visible (EBUSY = already mounted, fine).
-	if err := syscall.Mount("devtmpfs", "/dev", "devtmpfs", 0, ""); err != nil && err != syscall.EBUSY {
-		log.Printf("mounting /dev: %v (continuing)", err)
+// ensureDevMounted mounts an image device read-only, once.
+func ensureDevMounted(dev string) (string, error) {
+	if p, ok := mountedLowers[dev]; ok {
+		return p, nil
 	}
-	if err := syscall.Mount(dev, "/lower", "erofs", syscall.MS_RDONLY, ""); err != nil {
-		// ext4 fallback covers any image converted before the EROFS writer.
-		if err2 := syscall.Mount(dev, "/lower", "ext4", syscall.MS_RDONLY, ""); err2 != nil {
-			return fmt.Errorf("mounting image %s: erofs: %v; ext4: %w", dev, err, err2)
+	if len(mountedLowers) == 0 {
+		// libkrun's init normally provides /dev; make sure device nodes are
+		// visible (EBUSY = already mounted, fine).
+		if err := syscall.Mount("devtmpfs", "/dev", "devtmpfs", 0, ""); err != nil && err != syscall.EBUSY {
+			log.Printf("mounting /dev: %v (continuing)", err)
 		}
 	}
-	if err := syscall.Mount("tmpfs", "/rw", "tmpfs", 0, ""); err != nil {
-		return fmt.Errorf("mounting upper tmpfs: %w", err)
+	lower := "/lower-" + filepath.Base(dev)
+	if err := os.MkdirAll(lower, 0o755); err != nil {
+		return "", err
 	}
-	for _, d := range []string{"/rw/upper", "/rw/work"} {
+	if err := syscall.Mount(dev, lower, "erofs", syscall.MS_RDONLY, ""); err != nil {
+		// ext4 fallback covers images converted before the EROFS writer.
+		if err2 := syscall.Mount(dev, lower, "ext4", syscall.MS_RDONLY, ""); err2 != nil {
+			return "", fmt.Errorf("mounting image %s: erofs: %v; ext4: %w", dev, err, err2)
+		}
+	}
+	mountedLowers[dev] = lower
+	return lower, nil
+}
+
+// buildContainerRoot assembles one container's writable root.
+func buildContainerRoot(name, dev string) (string, error) {
+	lower, err := ensureDevMounted(dev)
+	if err != nil {
+		return "", err
+	}
+	rw := "/rw-" + name
+	root := "/roots/" + name
+	for _, d := range []string{rw, root} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
-			return err
+			return "", err
 		}
 	}
-	opts := "lowerdir=/lower,upperdir=/rw/upper,workdir=/rw/work"
-	if err := syscall.Mount("overlay", "/newroot", "overlay", 0, opts); err != nil {
-		return fmt.Errorf("mounting overlay: %w", err)
+	if err := syscall.Mount("tmpfs", rw, "tmpfs", 0, ""); err != nil {
+		return "", fmt.Errorf("upper tmpfs: %w", err)
+	}
+	for _, d := range []string{rw + "/upper", rw + "/work"} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return "", err
+		}
+	}
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s/upper,workdir=%s/work", lower, rw, rw)
+	if err := syscall.Mount("overlay", root, "overlay", 0, opts); err != nil {
+		return "", fmt.Errorf("overlay: %w", err)
 	}
 
-	// The kernel-backed filesystems the workload expects inside its root.
 	type m struct{ src, dst, fstype, opts string }
 	for _, mnt := range []m{
-		{"proc", "/newroot/proc", "proc", ""},
-		{"sysfs", "/newroot/sys", "sysfs", ""},
-		{"devtmpfs", "/newroot/dev", "devtmpfs", ""},
-		{"devpts", "/newroot/dev/pts", "devpts", "mode=620,ptmxmode=666"},
-		{"tmpfs", "/newroot/dev/shm", "tmpfs", "mode=1777"},
+		{"proc", root + "/proc", "proc", ""},
+		{"sysfs", root + "/sys", "sysfs", ""},
+		{"devtmpfs", root + "/dev", "devtmpfs", ""},
+		{"devpts", root + "/dev/pts", "devpts", "mode=620,ptmxmode=666"},
 	} {
 		os.MkdirAll(mnt.dst, 0o755)
 		if err := syscall.Mount(mnt.src, mnt.dst, mnt.fstype, 0, mnt.opts); err != nil {
 			log.Printf("mounting %s: %v (continuing)", mnt.dst, err)
 		}
 	}
-	// A usable /tmp even if the image tar lacked one.
-	if st, err := os.Stat("/newroot/tmp"); err != nil || !st.IsDir() {
-		os.MkdirAll("/newroot/tmp", 0o755)
+	// Pod-shared /dev/shm: one tmpfs for the whole pod (shared IPC).
+	if !podShmReady {
+		os.MkdirAll("/podshm", 0o755)
+		if err := syscall.Mount("tmpfs", "/podshm", "tmpfs", 0, "mode=1777"); err == nil {
+			podShmReady = true
+		}
 	}
-	os.Chmod("/newroot/tmp", 0o777|os.ModeSticky)
-	os.MkdirAll("/newroot/etc", 0o755)
+	if podShmReady {
+		os.MkdirAll(root+"/dev/shm", 0o755)
+		if err := syscall.Mount("/podshm", root+"/dev/shm", "", syscall.MS_BIND, ""); err != nil {
+			log.Printf("binding /dev/shm: %v (continuing)", err)
+		}
+	}
+	// A usable /tmp even if the image tar lacked one.
+	if st, err := os.Stat(root + "/tmp"); err != nil || !st.IsDir() {
+		os.MkdirAll(root+"/tmp", 0o755)
+	}
+	os.Chmod(root+"/tmp", 0o777|os.ModeSticky)
+	os.MkdirAll(root+"/etc", 0o755)
 
-	rootPrefix = "/newroot"
-	log.Printf("block root ready: %s -> overlay at /newroot", dev)
-	return nil
+	builtRoots = append(builtRoots, root)
+	log.Printf("container root ready: %s -> %s", dev, root)
+	return root, nil
+}
+
+// writeEtc writes an /etc file into every container root (and the boot
+// root, covering legacy dir mode where the boot root IS the container).
+func writeEtc(name string, content []byte) {
+	os.WriteFile("/etc/"+name, content, 0o644)
+	for _, root := range builtRoots {
+		os.WriteFile(root+"/etc/"+name, content, 0o644)
+	}
 }
 
 // lookPathInRoot resolves a bare command name against PATH *inside* the
@@ -135,6 +184,3 @@ func resolveInRoot(root, p string, depth int) (string, error) {
 	}
 	return cur, nil
 }
-
-// etcPath maps a guest /etc file to the workload's view of it.
-func etcPath(name string) string { return rootPrefix + "/etc/" + name }

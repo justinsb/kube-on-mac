@@ -54,7 +54,12 @@ int main(int argc, char *const argv[])
     const char *net_socket_path = NULL;
     const char *net2_socket_path = NULL;
     const char *net2_mac = NULL;
-    const char *root_image = NULL;
+    /* Image block devices: --root-image is repeatable (multi-container pods
+     * have one EROFS per distinct image). Order matters: the Nth --root-image
+     * becomes /dev/vd{a+N} in the guest, which the pod spec refers to. */
+#define MAX_ROOT_IMAGES 26
+    const char *root_images[MAX_ROOT_IMAGES];
+    int n_root_images = 0;
     long cpus = 1;
     long mem_mib = 256;
     long dax_mib = 0;
@@ -118,7 +123,14 @@ int main(int argc, char *const argv[])
             n_volumes++;
             break;
         }
-        case 'R': root_image = optarg; break;
+        case 'R':
+            if (n_root_images >= MAX_ROOT_IMAGES) {
+                fprintf(stderr, "too many --root-image args (max %d)\n",
+                        MAX_ROOT_IMAGES);
+                return 1;
+            }
+            root_images[n_root_images++] = optarg;
+            break;
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 1;
         }
@@ -187,11 +199,13 @@ int main(int argc, char *const argv[])
               "krun_add_virtiofs3"))
         return 1;
 
-    /* The image as a read-only raw ext4 block device (shared across every
+    /* Each image as a read-only raw EROFS block device (shared across every
      * pod of the image — one file, one host page cache). execd overlays a
-     * tmpfs upper on it and chroots the workload in. */
-    if (root_image != NULL) {
-        if (check(krun_add_disk(ctx, "root", root_image, true),
+     * tmpfs upper per container and chroots the workload in. */
+    for (int i = 0; i < n_root_images; i++) {
+        char block_id[16];
+        snprintf(block_id, sizeof(block_id), "root%d", i);
+        if (check(krun_add_disk(ctx, block_id, root_images[i], true),
                   "krun_add_disk"))
             return 1;
     }

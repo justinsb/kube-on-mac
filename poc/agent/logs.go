@@ -103,7 +103,7 @@ func (a *agent) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "expected /containerLogs/{namespace}/{pod}/{container}", http.StatusNotFound)
 		return
 	}
-	ns, podName := parts[0], parts[1]
+	ns, podName, container := parts[0], parts[1], parts[2]
 
 	client := a.cs()
 	if client == nil {
@@ -116,7 +116,13 @@ func (a *agent) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	uid := podStateUID(pod)
-	logPath := filepath.Join(a.workDir, string(uid), "container.log")
+	// execd writes per-container logs into the boot share; the merged
+	// console stream (container.log) remains as a fallback for legacy
+	// single-container dir-mode pods.
+	logPath := filepath.Join(a.workDir, string(uid), "rootfs", "logs", container+".log")
+	if _, err := os.Stat(logPath); err != nil {
+		logPath = filepath.Join(a.workDir, string(uid), "container.log")
+	}
 	f, err := os.Open(logPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("no logs for pod %s/%s: %v", ns, podName, err), http.StatusNotFound)

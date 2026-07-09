@@ -58,30 +58,52 @@ type podVM struct {
 
 	mu       sync.Mutex
 	cmd      *exec.Cmd
-	ready    bool
+	ready    map[string]bool // per main-container readiness (probe-driven)
 	stopping bool
-	restarts int32
+	restarts int32 // VM-level restarts (in-guest container restarts live in execd)
 	ip6      string
 	stopOnce sync.Once
+
+	// Digest of the last pushStatus payload (dedupe for the 5s poll).
+	lastPush string
 
 	// Last reported status, replayed onto the mirror pod when it is
 	// (re)created after the fact.
 	lastPhase  corev1.PodPhase
-	lastCS     *corev1.ContainerStatus
+	lastICS    []corev1.ContainerStatus
+	lastCS     []corev1.ContainerStatus
 	lastReason string
 	lastMsg    string
 }
 
 func (vm *podVM) setCmd(c *exec.Cmd) { vm.mu.Lock(); vm.cmd = c; vm.mu.Unlock() }
 func (vm *podVM) getCmd() *exec.Cmd  { vm.mu.Lock(); defer vm.mu.Unlock(); return vm.cmd }
-func (vm *podVM) setReady(r bool) bool {
+
+// initReady seeds per-container readiness: containers without readiness or
+// startup probes are ready as soon as they run; probed ones start unready.
+func (vm *podVM) initReady(pod *corev1.Pod) {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
-	changed := vm.ready != r
-	vm.ready = r
+	vm.ready = map[string]bool{}
+	for _, c := range pod.Spec.Containers {
+		vm.ready[c.Name] = c.ReadinessProbe == nil && c.StartupProbe == nil
+	}
+}
+func (vm *podVM) setContainerReady(name string, r bool) bool {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+	if vm.ready == nil {
+		vm.ready = map[string]bool{}
+	}
+	changed := vm.ready[name] != r
+	vm.ready[name] = r
 	return changed
 }
-func (vm *podVM) getReady() bool   { vm.mu.Lock(); defer vm.mu.Unlock(); return vm.ready }
+func (vm *podVM) containerReady(name string) bool {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+	return vm.ready[name]
+}
 func (vm *podVM) setIP(ip string)  { vm.mu.Lock(); vm.ip6 = ip; vm.mu.Unlock() }
 func (vm *podVM) getIP() string    { vm.mu.Lock(); defer vm.mu.Unlock(); return vm.ip6 }
 func (vm *podVM) setStopping()     { vm.mu.Lock(); vm.stopping = true; vm.mu.Unlock() }
@@ -269,6 +291,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("loading kubeconfig %s: %v (generate it with: pki --dir ../etc/kubernetes)", *kubeconfig, err)
 	}
+	// Kubelet-grade traffic: reconcile + per-pod status pushes would swamp
+	// client-go's default QPS=5, queueing every request seconds deep — which
+	// starves the (latency-sensitive) lazy service-LB resolution path.
+	cfg.QPS = 50
+	cfg.Burst = 100
 	client := kubernetes.NewForConfigOrDie(cfg)
 	log.Printf("waiting for the apiserver at %s...", cfg.Host)
 	for i := 0; ; i++ {
@@ -499,7 +526,10 @@ func (a *agent) reconcilePod(ctx context.Context, pod *corev1.Pod) {
 }
 
 // runPod owns a pod's whole lifecycle: prepare rootfs, then a supervise
-// loop — start VM, run probes, wait, restart per restartPolicy.
+// loop — start VM, run probes, poll per-container status, wait. Container
+// restarts happen *in-guest* (execd applies restartPolicy per container);
+// the VM itself restarts only if it dies without writing a final status
+// (crash) — the pod-level analogue of a node reboot.
 func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 	defer func() {
 		a.mu.Lock()
@@ -509,23 +539,30 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 
 	fail := func(reason string, err error) {
 		log.Printf("pod %s/%s: %s: %v", pod.Namespace, pod.Name, reason, err)
-		a.setPhase(ctx, pod, corev1.PodFailed, reason, err.Error(), nil)
+		a.setPhase(ctx, pod, corev1.PodFailed, reason, err.Error(), nil, nil)
 	}
+
+	if !a.imageBlock && (len(pod.Spec.Containers) > 1 || len(pod.Spec.InitContainers) > 0) {
+		fail("StartError", fmt.Errorf("multi-container pods require --image-block"))
+		return
+	}
+	vm.initReady(pod)
 
 	// Image pull / volume failures don't fail the pod: like the kubelet,
 	// keep it Pending (ErrImagePull / FailedMount) and retry with backoff
 	// (a Failed pod would be replaced by its ReplicaSet, churning a doomed
 	// pod forever).
-	var dir, rootfsBase string
+	var dir string
+	var bases map[string]string
 	var volArgs []string
-	var mounts []volumeMount
+	var mountsByC map[string][]volumeMount
 	for attempt := 0; ; attempt++ {
 		var err error
 		reason := "ErrImagePull"
-		dir, rootfsBase, err = a.preparePod(pod)
+		dir, bases, err = a.preparePod(pod)
 		if err == nil {
 			reason = "FailedMount"
-			volArgs, mounts, err = a.resolveVolumes(ctx, pod, dir)
+			volArgs, mountsByC, err = a.resolveVolumes(ctx, pod, dir)
 		}
 		if err == nil {
 			break
@@ -536,13 +573,9 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 		}
 		backoff := time.Duration(10<<min(attempt, 5)) * time.Second
 		log.Printf("pod %s/%s: %s (retrying in %s): %v", pod.Namespace, pod.Name, reason, backoff, err)
-		a.setPhase(ctx, pod, corev1.PodPending, "", "", &corev1.ContainerStatus{
-			Name:  pod.Spec.Containers[0].Name,
-			Image: pod.Spec.Containers[0].Image,
-			State: corev1.ContainerState{
-				Waiting: &corev1.ContainerStateWaiting{Reason: reason, Message: err.Error()},
-			},
-		})
+		a.setPhase(ctx, pod, corev1.PodPending, "", "",
+			waitingStatuses(pod.Spec.InitContainers, reason, err.Error()),
+			waitingStatuses(pod.Spec.Containers, reason, err.Error()))
 		deadline := time.Now().Add(backoff)
 		for time.Now().Before(deadline) && !vm.isStopping() {
 			select {
@@ -556,15 +589,33 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			return
 		}
 	}
-	c := pod.Spec.Containers[0]
 
-	memMB := int64(256)
-	if m, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
-		memMB = m.Value() / (1024 * 1024)
+	// VM sizing: the pod shares one VM, so sum the main containers' limits
+	// (an init container never runs alongside them, so it only raises the
+	// floor). Defaults: 256MiB / 1 cpu per container without limits.
+	memMB, cpus := int64(0), int64(0)
+	for _, c := range pod.Spec.Containers {
+		if m, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
+			memMB += m.Value() / (1024 * 1024)
+		} else {
+			memMB += 256
+		}
+		if q, ok := c.Resources.Limits[corev1.ResourceCPU]; ok {
+			cpus += q.Value()
+		}
 	}
-	cpus := int64(1)
-	if q, ok := c.Resources.Limits[corev1.ResourceCPU]; ok {
-		cpus = q.Value()
+	for _, c := range pod.Spec.InitContainers {
+		if m, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
+			if v := m.Value() / (1024 * 1024); v > memMB {
+				memMB = v
+			}
+		}
+	}
+	if memMB < 256 {
+		memMB = 256
+	}
+	if cpus < 1 {
+		cpus = 1
 	}
 
 	for attempt := 0; ; attempt++ {
@@ -583,13 +634,9 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			}
 			backoff := time.Duration(1<<min(attempt, 5)) * time.Second
 			log.Printf("pod %s/%s: StartError (retrying in %s): %v", pod.Namespace, pod.Name, backoff, err)
-			a.setPhase(ctx, pod, corev1.PodPending, "", "", &corev1.ContainerStatus{
-				Name:  c.Name,
-				Image: c.Image,
-				State: corev1.ContainerState{
-					Waiting: &corev1.ContainerStateWaiting{Reason: "StartError", Message: err.Error()},
-				},
-			})
+			a.setPhase(ctx, pod, corev1.PodPending, "", "",
+				waitingStatuses(pod.Spec.InitContainers, "StartError", err.Error()),
+				waitingStatuses(pod.Spec.Containers, "StartError", err.Error()))
 			select {
 			case <-ctx.Done():
 				return false
@@ -602,10 +649,9 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			return true
 		}
 
-		// Fresh container filesystem for every (re)start, matching kubelet
-		// semantics. The clone is an APFS clonefile copy, so this is cheap.
-		// (Volumes live outside the rootfs and persist across restarts.)
-		rootfs, err := a.makeRootfs(pod, dir, rootfsBase, mounts)
+		// Fresh boot filesystem for every VM (re)start. (Volumes live
+		// outside the rootfs and persist across restarts.)
+		rootfs, images, err := a.makeRootfs(pod, dir, bases, mountsByC)
 		if err != nil {
 			if retryStart(err) {
 				continue
@@ -632,8 +678,10 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			"--vsock-exec", execSockPath(pod.UID),
 		}
 		harnessArgs = append(harnessArgs, volArgs...)
-		if a.imageBlock {
-			harnessArgs = append(harnessArgs, "--root-image", rootfsBase+".erofs")
+		// One EROFS block device per distinct image, in the device order the
+		// spec's rootDev fields assume (--root-image i => /dev/vd{a+i}).
+		for _, img := range images {
+			harnessArgs = append(harnessArgs, "--root-image", img+".erofs")
 		}
 		var gvp *exec.Cmd
 		if a.gvproxyPath != "" {
@@ -650,7 +698,7 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			// -ssh-port -1 disables gvproxy's default 127.0.0.1:2222
 			// forward, which would collide across per-pod instances.
 			gvArgs := []string{"-listen-vfkit", "unixgram://" + netSock, "-ssh-port", "-1"}
-			hostPorts := collectHostPorts(c)
+			hostPorts := collectHostPorts(pod)
 			apiSock := gvproxyAPISockPath(pod.UID)
 			if len(hostPorts) > 0 {
 				// The control API is only opened when needed (hostPorts).
@@ -767,20 +815,13 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			pod.Namespace, pod.Name, cmd.Process.Pid, cpus, memMB, vm.restartCount())
 
 		started := metav1.Now()
-		// Ready immediately only if there's no readiness (or startup) probe.
-		vm.setReady(c.ReadinessProbe == nil && c.StartupProbe == nil)
-		a.setPhase(ctx, pod, corev1.PodRunning, "", "", &corev1.ContainerStatus{
-			Name:         c.Name,
-			Ready:        vm.getReady(),
-			RestartCount: vm.restartCount(),
-			State: corev1.ContainerState{
-				Running: &corev1.ContainerStateRunning{StartedAt: started},
-			},
-			Image: c.Image,
-		})
+		// First status right away (execd reports per-container states), then
+		// keep polling; probes push updates on readiness transitions too.
+		a.pushStatus(ctx, pod, vm)
 
 		probeStop := make(chan struct{})
 		go a.runProbes(ctx, pod, vm, probeStop)
+		go a.statusLoop(ctx, pod, vm, probeStop)
 
 		err = cmd.Wait()
 		close(probeStop)
@@ -793,74 +834,48 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 			vmnetCmd.Process.Kill()
 			vmnetCmd.Wait()
 		}
+		log.Printf("pod %s/%s: microVM exited", pod.Namespace, pod.Name)
 
-		exitCode := int32(0)
-		csReason := "Completed"
-		if err != nil {
-			csReason = "Error"
-			exitCode = 1
-			if ee, ok := err.(*exec.ExitError); ok {
-				exitCode = int32(ee.ExitCode())
+		// A clean pod end (all containers done per restartPolicy, or a
+		// graceful shutdown) leaves execd's final per-container status in the
+		// boot share. No file means the VM died mid-flight: the pod-level
+		// analogue of a node crash — restart the whole VM.
+		if final, ok := readFinalStatus(dir); ok {
+			ics, css, _ := a.translateStatuses(pod, final, vm)
+			phase := finalPhase(ics, css)
+			a.setPhase(context.Background(), pod, phase, "", "", ics, css)
+			if vm.isStopping() {
+				a.finalizePod(pod, vm)
 			}
-		}
-		finished := metav1.Now()
-		terminated := &corev1.ContainerStatus{
-			Name:         c.Name,
-			Ready:        false,
-			RestartCount: vm.restartCount(),
-			State: corev1.ContainerState{
-				Terminated: &corev1.ContainerStateTerminated{
-					ExitCode:   exitCode,
-					Reason:     csReason,
-					StartedAt:  started,
-					FinishedAt: finished,
-				},
-			},
-			Image: c.Image,
-		}
-		log.Printf("pod %s/%s: microVM exited (code %d)", pod.Namespace, pod.Name, exitCode)
-
-		if vm.isStopping() {
-			// Deletion in progress: report final state and finalize.
-			phase := corev1.PodSucceeded
-			if exitCode != 0 {
-				phase = corev1.PodFailed
-			}
-			a.setPhase(context.Background(), pod, phase, "", "", terminated)
-			a.finalizePod(pod, vm)
 			return
 		}
 
+		if vm.isStopping() {
+			a.setPhase(context.Background(), pod, corev1.PodFailed, "VMCrashed",
+				"microVM exited without a final status", nil, nil)
+			a.finalizePod(pod, vm)
+			return
+		}
 		policy := pod.Spec.RestartPolicy
 		if policy == "" {
 			policy = corev1.RestartPolicyAlways
 		}
-		if policy == corev1.RestartPolicyNever ||
-			(policy == corev1.RestartPolicyOnFailure && exitCode == 0) {
-			phase := corev1.PodSucceeded
-			if exitCode != 0 {
-				phase = corev1.PodFailed
-			}
-			a.setPhase(context.Background(), pod, phase, "", "", terminated)
+		if policy == corev1.RestartPolicyNever {
+			fail("VMCrashed", fmt.Errorf("microVM exited without a final status"))
 			return
 		}
 
-		// Restarting. Naive crash backoff, reset after a long healthy run.
-		if finished.Sub(started.Time) > 5*time.Minute {
+		// Restarting the VM. Naive crash backoff, reset after a long run.
+		if time.Since(started.Time) > 5*time.Minute {
 			attempt = 0
 		}
 		backoff := time.Duration(1<<min(attempt, 5)) * time.Second
 		vm.mu.Lock()
 		vm.restarts++
 		vm.mu.Unlock()
-		terminated.State = corev1.ContainerState{
-			Waiting: &corev1.ContainerStateWaiting{
-				Reason:  "CrashLoopBackOff",
-				Message: fmt.Sprintf("restarting in %s", backoff),
-			},
-		}
-		terminated.RestartCount = vm.restartCount()
-		a.setPhase(context.Background(), pod, corev1.PodRunning, "", "", terminated)
+		a.setPhase(context.Background(), pod, corev1.PodRunning, "", "",
+			waitingStatuses(pod.Spec.InitContainers, "CrashLoopBackOff", fmt.Sprintf("VM restarting in %s", backoff)),
+			waitingStatuses(pod.Spec.Containers, "CrashLoopBackOff", fmt.Sprintf("VM restarting in %s", backoff)))
 		select {
 		case <-ctx.Done():
 			return
@@ -890,34 +905,46 @@ func (a *agent) finalizePod(pod *corev1.Pod, vm *podVM) {
 		metav1.DeleteOptions{GracePeriodSeconds: &zero})
 }
 
-// preparePod does the once-per-pod work: pull the image, create the state
-// dir. Returns (stateDir, imageRootfsBase).
-func (a *agent) preparePod(pod *corev1.Pod) (string, string, error) {
+// preparePod does the once-per-pod work: pull every container's image
+// (deduped — containers sharing an image share the cached EROFS) and create
+// the state dir. Returns (stateDir, image -> imageRootfsBase).
+func (a *agent) preparePod(pod *corev1.Pod) (string, map[string]string, error) {
 	if len(pod.Spec.Containers) == 0 {
-		return "", "", fmt.Errorf("no containers")
+		return "", nil, fmt.Errorf("no containers")
 	}
-	c := pod.Spec.Containers[0]
-
-	// Pull the image (cached after first use).
-	rootfsBase, err := a.ensureImage(c.Image)
-	if err != nil {
-		return "", "", fmt.Errorf("pulling image %q: %w", c.Image, err)
+	bases := map[string]string{}
+	for _, c := range allContainers(pod) {
+		if _, ok := bases[c.Image]; ok {
+			continue
+		}
+		base, err := a.ensureImage(c.Image)
+		if err != nil {
+			return "", nil, fmt.Errorf("pulling image %q: %w", c.Image, err)
+		}
+		bases[c.Image] = base
 	}
 
 	dir := filepath.Join(a.workDir, string(pod.UID))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", "", err
+		return "", nil, err
 	}
-	return dir, rootfsBase, nil
+	return dir, bases, nil
+}
+
+// allContainers returns init containers followed by main containers — the
+// order device assignment and status reporting both use.
+func allContainers(pod *corev1.Pod) []corev1.Container {
+	return append(append([]corev1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...)
 }
 
 // makeRootfs materializes the guest boot filesystem. In block mode this is
 // a tiny staging dir — just execd, the spec, and mountpoint dirs — because
-// the image itself arrives as a read-only virtio-blk ext4 that execd
-// overlays (tmpfs upper) and chroots the workload into. In dir mode it is
-// the legacy APFS clone of the flattened image.
-func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string, mounts []volumeMount) (string, error) {
-	c := pod.Spec.Containers[0]
+// each image arrives as a read-only virtio-blk EROFS that execd overlays
+// (tmpfs upper) and chroots its container into. In dir mode it is the
+// legacy APFS clone of the flattened image (single-container only).
+// Returns the rootfs path and the images (rootfs bases) to attach as block
+// devices, in /dev/vdX assignment order.
+func (a *agent) makeRootfs(pod *corev1.Pod, dir string, bases map[string]string, mountsByC map[string][]volumeMount) (string, []string, error) {
 	rootfs := filepath.Join(dir, "rootfs")
 
 	if _, err := os.Stat(rootfs); err == nil {
@@ -925,69 +952,113 @@ func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string, mounts []vol
 			// The guest may have created write-protected dirs; loosen and retry.
 			exec.Command("/bin/chmod", "-R", "u+rwX", rootfs).Run()
 			if err := os.RemoveAll(rootfs); err != nil {
-				return "", fmt.Errorf("removing previous rootfs: %w", err)
+				return "", nil, fmt.Errorf("removing previous rootfs: %w", err)
 			}
 		}
 	}
 	if a.imageBlock {
-		// Boot dir: execd + spec + the dirs libkrun's init and execd expect.
-		for _, d := range []string{"", "dev", "proc", "sys", "newroot", "lower", "rw"} {
+		// Boot dir: execd + spec + the dirs libkrun's init expects. execd
+		// creates its per-container overlay dirs itself.
+		for _, d := range []string{"", "dev", "proc", "sys"} {
 			if err := os.MkdirAll(filepath.Join(rootfs, d), 0o755); err != nil {
-				return "", err
+				return "", nil, err
 			}
 		}
 	} else {
 		// APFS clonefile copy of the base rootfs: instant, copy-on-write.
 		// -p matters: without it, directories are recreated subject to the
 		// umask, silently stripping e.g. /tmp's 1777 down to 1755.
-		if out, err := exec.Command("/bin/cp", "-Rpc", rootfsBase, rootfs).CombinedOutput(); err != nil {
-			return "", fmt.Errorf("cloning rootfs: %v: %s", err, out)
+		if out, err := exec.Command("/bin/cp", "-Rpc", bases[pod.Spec.Containers[0].Image], rootfs).CombinedOutput(); err != nil {
+			return "", nil, fmt.Errorf("cloning rootfs: %v: %s", err, out)
 		}
 	}
 
-	// The guest boots into execd, which supervises the workload (on a pty
+	// The guest boots into execd, which supervises every container (on a pty
 	// when the pod asks for one) and serves exec/attach over vsock. Workload
 	// argv travels in a spec file: libkrun passes exec args via the kernel
 	// cmdline, which splits on whitespace, so it must go out-of-band.
 	if out, err := exec.Command("/bin/cp", "-c", a.execdPath, filepath.Join(rootfs, "execd")).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("installing execd: %v: %s", err, out)
+		return "", nil, fmt.Errorf("installing execd: %v: %s", err, out)
 	}
-	argv := append(append([]string{}, c.Command...), c.Args...)
-	if len(argv) == 0 {
-		argv = imageArgv(rootfsBase)
-	}
-	if len(argv) == 0 {
-		return "", fmt.Errorf("no command: pod spec has none and image config has no Entrypoint/Cmd")
-	}
-	specData := map[string]any{"argv": argv, "tty": c.TTY}
-	if a.imageBlock {
-		specData["rootDev"] = "/dev/vda"
-	}
-	// Environment: image config env, overridden by pod spec env. valueFrom
-	// (fieldRef/configMap/secret) is not implemented.
-	env := imageEnv(rootfsBase)
-	for _, e := range c.Env {
-		if e.ValueFrom != nil {
-			log.Printf("pod %s/%s: env %s uses valueFrom (not implemented); skipping", pod.Namespace, pod.Name, e.Name)
-			continue
+
+	// Device assignment: distinct images in first-use order (inits, then
+	// mains) map to /dev/vda, vdb, ... — matching the harness's --root-image
+	// order.
+	var orderedImages []string
+	devByBase := map[string]string{}
+	containerSpec := func(c corev1.Container) (map[string]any, error) {
+		base := bases[c.Image]
+		argv := append(append([]string{}, c.Command...), c.Args...)
+		if len(argv) == 0 {
+			argv = imageArgv(base)
 		}
-		env = append(env, e.Name+"="+e.Value)
+		if len(argv) == 0 {
+			return nil, fmt.Errorf("container %s: no command: pod spec has none and image config has no Entrypoint/Cmd", c.Name)
+		}
+		cs := map[string]any{"name": c.Name, "argv": argv, "tty": c.TTY}
+		if a.imageBlock {
+			dev, ok := devByBase[base]
+			if !ok {
+				dev = fmt.Sprintf("/dev/vd%c", 'a'+len(orderedImages))
+				devByBase[base] = dev
+				orderedImages = append(orderedImages, base)
+			}
+			cs["rootDev"] = dev
+		}
+		// Environment: image config env, overridden by pod spec env. valueFrom
+		// (fieldRef/configMap/secret) is not implemented.
+		env := imageEnv(base)
+		for _, e := range c.Env {
+			if e.ValueFrom != nil {
+				log.Printf("pod %s/%s: env %s uses valueFrom (not implemented); skipping", pod.Namespace, pod.Name, e.Name)
+				continue
+			}
+			env = append(env, e.Name+"="+e.Value)
+		}
+		if len(env) > 0 {
+			cs["env"] = env
+		}
+		// Working directory: pod spec overrides image config. Without this,
+		// entrypoints that operate on "." (e.g. redis's chown of its WORKDIR
+		// /data) run against / instead.
+		cwd := c.WorkingDir
+		if cwd == "" {
+			cwd = imageWorkingDir(base)
+		}
+		if cwd != "" {
+			cs["cwd"] = cwd
+		}
+		if len(mountsByC[c.Name]) > 0 {
+			cs["mounts"] = mountsByC[c.Name]
+		}
+		return cs, nil
 	}
-	if len(env) > 0 {
-		specData["env"] = env
+
+	policy := pod.Spec.RestartPolicy
+	if policy == "" {
+		policy = corev1.RestartPolicyAlways
 	}
-	// Working directory: pod spec overrides image config. Without this,
-	// entrypoints that operate on "." (e.g. redis's chown of its WORKDIR
-	// /data) run against / instead.
-	cwd := c.WorkingDir
-	if cwd == "" {
-		cwd = imageWorkingDir(rootfsBase)
+	var inits, mains []map[string]any
+	for _, c := range pod.Spec.InitContainers {
+		cs, err := containerSpec(c)
+		if err != nil {
+			return "", nil, err
+		}
+		inits = append(inits, cs)
 	}
-	if cwd != "" {
-		specData["cwd"] = cwd
+	for _, c := range pod.Spec.Containers {
+		cs, err := containerSpec(c)
+		if err != nil {
+			return "", nil, err
+		}
+		mains = append(mains, cs)
 	}
-	if len(mounts) > 0 {
-		specData["mounts"] = mounts
+	specData := map[string]any{
+		"restartPolicy": string(policy),
+		"containers":    mains,
+	}
+	if len(inits) > 0 {
+		specData["initContainers"] = inits
 	}
 	if a.vmnetHelper != "" {
 		specData["net6"] = map[string]string{
@@ -1006,12 +1077,12 @@ func (a *agent) makeRootfs(pod *corev1.Pod, dir, rootfsBase string, mounts []vol
 	}
 	specJSON, err := json.Marshal(specData)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if err := os.WriteFile(filepath.Join(rootfs, ".podvm-spec.json"), specJSON, 0o644); err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return rootfs, nil
+	return rootfs, orderedImages, nil
 }
 
 // volumeMount is one entry of the guest-side mount plan (spec JSON).
@@ -1021,47 +1092,43 @@ type volumeMount struct {
 	ReadOnly  bool   `json:"readOnly,omitempty"`
 }
 
-// resolveVolumes turns the pod's volumes + the container's volumeMounts into
-// harness --volume args (one virtio-fs device per volume) and the guest-side
-// mount plan. Supported: hostPath (Directory / DirectoryOrCreate / "") and
-// emptyDir (a host dir under the pod state dir, so it survives container
-// restarts and dies with the pod — kubelet semantics). Projected volumes
-// (the auto-injected ServiceAccount token) are skipped quietly; anything
-// else is an error, matching a kubelet that can't set up a volume.
-func (a *agent) resolveVolumes(ctx context.Context, pod *corev1.Pod, stateDir string) (harnessArgs []string, mounts []volumeMount, err error) {
-	c := pod.Spec.Containers[0]
-	if len(c.VolumeMounts) == 0 {
-		return nil, nil, nil
-	}
+// resolveVolumes turns the pod's volumes + every container's volumeMounts
+// into harness --volume args (one virtio-fs device per volume, shared by all
+// containers that mount it — this is how a shared emptyDir works across a
+// pod) and per-container guest-side mount plans. Supported: hostPath
+// (Directory / DirectoryOrCreate / "") and emptyDir (a host dir under the
+// pod state dir, so it survives container restarts and dies with the pod —
+// kubelet semantics). Projected volumes (the auto-injected ServiceAccount
+// token) are skipped quietly; anything else is an error, matching a kubelet
+// that can't set up a volume.
+func (a *agent) resolveVolumes(ctx context.Context, pod *corev1.Pod, stateDir string) (harnessArgs []string, mountsByC map[string][]volumeMount, err error) {
 	static := pod.Annotations[sourceAnnotation] == "file"
 	byName := map[string]*corev1.Volume{}
 	for i := range pod.Spec.Volumes {
 		byName[pod.Spec.Volumes[i].Name] = &pod.Spec.Volumes[i]
 	}
-	// A volume's virtio-fs device is read-only only if every mount of it is.
-	// configMap/secret volumes are always read-only (kubelet semantics).
+	containers := allContainers(pod)
+	// A volume's virtio-fs device is read-only only if every mount of it, in
+	// every container, is. configMap/secret volumes are always read-only
+	// (kubelet semantics).
 	anyRW := map[string]bool{}
 	forceRO := map[string]bool{}
-	for _, m := range c.VolumeMounts {
-		if !m.ReadOnly {
-			anyRW[m.Name] = true
+	for _, c := range containers {
+		for _, m := range c.VolumeMounts {
+			if !m.ReadOnly {
+				anyRW[m.Name] = true
+			}
 		}
 	}
-	tags := map[string]string{} // volume name -> tag
-	for _, m := range c.VolumeMounts {
-		vol := byName[m.Name]
-		if vol == nil {
-			return nil, nil, fmt.Errorf("volumeMount %q: no such volume", m.Name)
-		}
-		if m.SubPath != "" || m.SubPathExpr != "" {
-			return nil, nil, fmt.Errorf("volumeMount %q: subPath not supported", m.Name)
+
+	// materialize resolves a volume to its host dir, once per volume.
+	hostDirs := map[string]string{}
+	materialize := func(vol *corev1.Volume) (string, error) {
+		if d, ok := hostDirs[vol.Name]; ok {
+			return d, nil
 		}
 		var hostDir string
 		switch {
-		case vol.Projected != nil:
-			// ServiceAccount token projection, injected by admission into
-			// every pod. Not implemented; skipping it keeps all pods usable.
-			continue
 		case vol.HostPath != nil:
 			hostDir = vol.HostPath.Path
 			t := corev1.HostPathUnset
@@ -1071,57 +1138,83 @@ func (a *agent) resolveVolumes(ctx context.Context, pod *corev1.Pod, stateDir st
 			switch t {
 			case corev1.HostPathUnset, corev1.HostPathDirectory:
 				if st, err := os.Stat(hostDir); err != nil || !st.IsDir() {
-					return nil, nil, fmt.Errorf("hostPath %q: not an existing directory", hostDir)
+					return "", fmt.Errorf("hostPath %q: not an existing directory", hostDir)
 				}
 			case corev1.HostPathDirectoryOrCreate:
 				if err := os.MkdirAll(hostDir, 0o755); err != nil {
-					return nil, nil, fmt.Errorf("hostPath %q: %w", hostDir, err)
+					return "", fmt.Errorf("hostPath %q: %w", hostDir, err)
 				}
 			default:
-				return nil, nil, fmt.Errorf("hostPath type %q not supported (Directory/DirectoryOrCreate only)", t)
+				return "", fmt.Errorf("hostPath type %q not supported (Directory/DirectoryOrCreate only)", t)
 			}
 		case vol.EmptyDir != nil:
 			hostDir = filepath.Join(stateDir, "volumes", vol.Name)
 			if err := os.MkdirAll(hostDir, 0o755); err != nil {
-				return nil, nil, fmt.Errorf("emptyDir %q: %w", vol.Name, err)
+				return "", fmt.Errorf("emptyDir %q: %w", vol.Name, err)
 			}
 		case vol.ConfigMap != nil:
 			if static {
-				return nil, nil, fmt.Errorf("volume %q: static pods cannot reference API objects (configMap)", vol.Name)
+				return "", fmt.Errorf("volume %q: static pods cannot reference API objects (configMap)", vol.Name)
 			}
 			hostDir = filepath.Join(stateDir, "volumes", vol.Name)
 			if err := a.materializeConfigMap(ctx, pod.Namespace, vol.ConfigMap, hostDir); err != nil {
-				return nil, nil, err
+				return "", err
 			}
 			forceRO[vol.Name] = true
 		case vol.Secret != nil:
 			if static {
-				return nil, nil, fmt.Errorf("volume %q: static pods cannot reference API objects (secret)", vol.Name)
+				return "", fmt.Errorf("volume %q: static pods cannot reference API objects (secret)", vol.Name)
 			}
 			hostDir = filepath.Join(stateDir, "volumes", vol.Name)
 			if err := a.materializeSecret(ctx, pod.Namespace, vol.Secret, hostDir); err != nil {
-				return nil, nil, err
+				return "", err
 			}
 			forceRO[vol.Name] = true
 		default:
-			return nil, nil, fmt.Errorf("volume %q: unsupported volume type (hostPath, emptyDir, configMap, secret)", vol.Name)
+			return "", fmt.Errorf("volume %q: unsupported volume type (hostPath, emptyDir, configMap, secret)", vol.Name)
 		}
-		tag, ok := tags[vol.Name]
-		if !ok {
-			tag = fmt.Sprintf("vol%d", len(tags))
-			tags[vol.Name] = tag
-			arg := tag + "=" + hostDir
-			if !anyRW[vol.Name] || forceRO[vol.Name] {
-				arg += ":ro" // VMM-side enforcement; guest adds MS_RDONLY per mount
-			}
-			harnessArgs = append(harnessArgs, "--volume", arg)
-		}
-		mounts = append(mounts, volumeMount{Tag: tag, MountPath: m.MountPath, ReadOnly: m.ReadOnly || forceRO[vol.Name]})
+		hostDirs[vol.Name] = hostDir
+		return hostDir, nil
 	}
-	return harnessArgs, mounts, nil
+
+	mountsByC = map[string][]volumeMount{}
+	tags := map[string]string{} // volume name -> tag
+	for _, c := range containers {
+		for _, m := range c.VolumeMounts {
+			vol := byName[m.Name]
+			if vol == nil {
+				return nil, nil, fmt.Errorf("volumeMount %q: no such volume", m.Name)
+			}
+			if m.SubPath != "" || m.SubPathExpr != "" {
+				return nil, nil, fmt.Errorf("volumeMount %q: subPath not supported", m.Name)
+			}
+			if vol.Projected != nil {
+				// ServiceAccount token projection, injected by admission into
+				// every pod. Not implemented; skipping it keeps all pods usable.
+				continue
+			}
+			hostDir, err := materialize(vol)
+			if err != nil {
+				return nil, nil, err
+			}
+			tag, ok := tags[vol.Name]
+			if !ok {
+				tag = fmt.Sprintf("vol%d", len(tags))
+				tags[vol.Name] = tag
+				arg := tag + "=" + hostDir
+				if !anyRW[vol.Name] || forceRO[vol.Name] {
+					arg += ":ro" // VMM-side enforcement; guest adds MS_RDONLY per mount
+				}
+				harnessArgs = append(harnessArgs, "--volume", arg)
+			}
+			mountsByC[c.Name] = append(mountsByC[c.Name],
+				volumeMount{Tag: tag, MountPath: m.MountPath, ReadOnly: m.ReadOnly || forceRO[vol.Name]})
+		}
+	}
+	return harnessArgs, mountsByC, nil
 }
 
-func (a *agent) setPhase(ctx context.Context, pod *corev1.Pod, phase corev1.PodPhase, reason, message string, cs *corev1.ContainerStatus) {
+func (a *agent) setPhase(ctx context.Context, pod *corev1.Pod, phase corev1.PodPhase, reason, message string, ics, css []corev1.ContainerStatus) {
 	a.mu.Lock()
 	vm := a.vms[pod.UID]
 	a.mu.Unlock()
@@ -1134,7 +1227,7 @@ func (a *agent) setPhase(ctx context.Context, pod *corev1.Pod, phase corev1.PodP
 		name = vm.mirrorName
 		vm.mu.Lock()
 		vm.lastPhase, vm.lastReason, vm.lastMsg = phase, reason, message
-		vm.lastCS = cs
+		vm.lastICS, vm.lastCS = ics, css
 		vm.mu.Unlock()
 	}
 	client := a.cs()
@@ -1152,10 +1245,14 @@ func (a *agent) setPhase(ctx context.Context, pod *corev1.Pod, phase corev1.PodP
 	if latest.Status.StartTime == nil {
 		latest.Status.StartTime = &now
 	}
+	// PodReady = running with every (main) container ready.
 	ready := corev1.ConditionFalse
-	if phase == corev1.PodRunning {
-		if vm == nil || vm.getReady() {
-			ready = corev1.ConditionTrue
+	if phase == corev1.PodRunning && len(css) > 0 {
+		ready = corev1.ConditionTrue
+		for _, cs := range css {
+			if !cs.Ready {
+				ready = corev1.ConditionFalse
+			}
 		}
 	}
 	if vm != nil && vm.getIP() != "" {
@@ -1167,8 +1264,11 @@ func (a *agent) setPhase(ctx context.Context, pod *corev1.Pod, phase corev1.PodP
 		{Type: corev1.PodReady, Status: ready, LastTransitionTime: now},
 		{Type: corev1.ContainersReady, Status: ready, LastTransitionTime: now},
 	}
-	if cs != nil {
-		latest.Status.ContainerStatuses = []corev1.ContainerStatus{*cs}
+	if css != nil {
+		latest.Status.ContainerStatuses = css
+	}
+	if ics != nil {
+		latest.Status.InitContainerStatuses = ics
 	}
 	if _, err := a.cs().CoreV1().Pods(pod.Namespace).UpdateStatus(ctx, latest, metav1.UpdateOptions{}); err != nil {
 		log.Printf("updating status for %s/%s: %v", pod.Namespace, pod.Name, err)
