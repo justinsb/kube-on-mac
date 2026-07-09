@@ -240,6 +240,14 @@ func (a *agent) syncMirrorPods(ctx context.Context, running map[string]*staticPo
 
 func (a *agent) createMirrorPod(ctx context.Context, sp *staticPod) {
 	client := a.cs()
+	// NodeRestriction requires (and the kubelet contract specifies) that a
+	// node's mirror pods carry an owner reference to the Node itself — it's
+	// also what garbage-collects them if the node is deleted.
+	node, err := client.CoreV1().Nodes().Get(ctx, a.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return // not registered yet; next sync tick retries
+	}
+	yes := true
 	mirror := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sp.vm.mirrorName,
@@ -250,6 +258,13 @@ func (a *agent) createMirrorPod(ctx context.Context, sp *staticPod) {
 				hashAnnotation:   string(sp.pod.UID),
 				sourceAnnotation: "file",
 			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1",
+				Kind:       "Node",
+				Name:       node.Name,
+				UID:        node.UID,
+				Controller: &yes,
+			}},
 		},
 		Spec: *sp.pod.Spec.DeepCopy(),
 	}

@@ -1,12 +1,11 @@
-# The node agent's client identity. The honest form is the node identity
-# alone (system:nodes + Node authorizer), but the agent still plays roles
-# beyond a kubelet's — mirror Services, service/endpoint resolution across
-# namespaces — so it carries system:masters for now; dropping it is tracked
-# in the research note's open questions.
+# The node agent's client identity: the node itself, authorized by the Node
+# authorizer plus the explicit grants in ../rbac.yaml (the agent also plays
+# the node's kube-proxy/DNS hat: service and endpoint resolution, bootstrap
+# ClusterIP claims). No system:masters.
 apiVersion: kube-on-macos.io/v1alpha1
 kind: Certificate
 spec:
   issuerRef: pki/ca
   commonName: system:node:macos-poc
-  organizations: [system:nodes, system:masters]
+  organizations: [system:nodes]
   usages: ["client auth"]

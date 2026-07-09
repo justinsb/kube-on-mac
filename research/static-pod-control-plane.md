@@ -49,7 +49,7 @@ others; we start with one and note the collapse.)
 | `admin.crt`, `.key` | CN=`admin`, O=`system:masters` → `admin.kubeconfig` |
 | `controller-manager.crt`, `.key` | CN=`system:kube-controller-manager` (RBAC binds this user to exactly the controllers' powers) |
 | `scheduler.crt`, `.key` | CN=`system:kube-scheduler` |
-| `agent.crt`, `.key` | the node agent's client identity. Today (via envtest) the agent is `system:masters`; the honest identity is CN=`system:node:macos-poc`, O=`system:nodes` + the Node authorizer. Start with masters, note the downgrade path |
+| `agent.crt`, `.key` | the node agent's client identity: CN=`system:node:macos-poc`, O=`system:nodes` — Node authorizer + NodeRestriction, plus the explicit resolver grants in `rbac.yaml`. (Started life with system:masters; dropped 2026-07-09) |
 | `apiserver-kubelet-client.crt`, `.key` | apiserver's client cert for connecting to the kubelet's :10250 (logs/exec). The agent's kubelet server currently checks nothing; verifying this cert is the natural first authn there |
 | `etcd-server.crt`/`.key`, `etcd-client.crt`/`.key` | see the etcd security decision below — likely needed, because our pod network is a shared L2 |
 
@@ -288,10 +288,24 @@ trade, and it isn't a virtiofs limitation — it's the host OS contract.
 
 - etcd TLS vs colocation (above) — leaning TLS.
 - One CA vs split CAs; front-proxy CA is deferred until aggregated APIs.
-- Agent identity: when to drop `system:masters` for
-  `system:node:` + Node authorizer + NodeRestriction.
-- Kubelet server authn: verify the apiserver's kubelet-client cert (cheap,
-  in the inventory) vs delegated TokenReview (real, later).
+- ~~Agent identity: when to drop `system:masters`~~ **DONE (2026-07-09):**
+  the agent is `system:node:macos-poc` + `system:nodes` under the Node
+  authorizer with NodeRestriction admission on; its kube-proxy/DNS-shaped
+  powers (service/endpoint reads, bootstrap-VIP Service claims) are an
+  explicit ClusterRole in `etc/kubernetes/rbac.yaml`, applied once with
+  admin credentials at bootstrap. NodeRestriction immediately enforced two
+  real contract details we had skipped: mirror pods must carry an
+  ownerReference to the Node, and kubelets may not set most
+  `node.kubernetes.io/` labels (our os-host label moved to the
+  `kube-on-macos.io/` namespace). Verified: the agent's kubeconfig gets
+  Forbidden on secrets and deployment creation.
+- ~~Kubelet server authn~~ **DONE (2026-07-09):** the kubelet server
+  serves `pki/kubelet-server.crt`, the apiserver verifies it
+  (`--kubelet-certificate-authority`), and the server requires a CA-signed
+  client cert, authorizing only CN=`kube-apiserver-kubelet-client` (or a
+  `system:masters` cert). Anonymous :10250 connections fail the TLS
+  handshake. Delegated TokenReview/SubjectAccessReview remains the fuller
+  contract, later.
 - Cert rotation/renewal: out of scope — these are dev artifacts;
   regenerate = rerun the tool. Note it as the gap it is.
 - ~~Upgrades: a version bump is editing the image tag in a manifest file —

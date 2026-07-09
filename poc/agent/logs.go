@@ -3,16 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -26,15 +21,25 @@ import (
 )
 
 // startKubeletServer serves the slice of the kubelet API the apiserver
-// proxies to: for now just /containerLogs, which is what `kubectl logs`
-// uses. HTTPS with an ephemeral self-signed cert — the apiserver does not
-// verify the kubelet's serving cert unless --kubelet-certificate-authority
-// is set. No authn/authz (PoC; the real agent must do delegated
-// TokenReview/SubjectAccessReview here).
+// proxies to (/containerLogs, /exec, /attach). TLS both ways, from the
+// declarative PKI: it serves pki/kubelet-server.crt (which the apiserver
+// verifies via --kubelet-certificate-authority), and it requires a
+// CA-signed client certificate, accepting only the apiserver's kubelet
+// client identity (or a system:masters cert). This replaces both the
+// ephemeral self-signed cert and the everyone-welcome policy. Delegated
+// TokenReview/SubjectAccessReview would be the fuller kubelet contract.
 func (a *agent) startKubeletServer(ctx context.Context, port int) error {
-	cert, err := selfSignedCert(a.nodeName)
+	cert, err := tls.LoadX509KeyPair(a.kubeletCert, a.kubeletKey)
 	if err != nil {
-		return fmt.Errorf("generating serving cert: %w", err)
+		return fmt.Errorf("loading kubelet serving cert (run pki?): %w", err)
+	}
+	caPEM, err := os.ReadFile(a.clientCA)
+	if err != nil {
+		return fmt.Errorf("loading client CA: %w", err)
+	}
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caPEM) {
+		return fmt.Errorf("no certificates in %s", a.clientCA)
 	}
 
 	mux := http.NewServeMux()
@@ -43,8 +48,12 @@ func (a *agent) startKubeletServer(ctx context.Context, port int) error {
 	mux.HandleFunc("/attach/", a.handleAttach)
 
 	srv := &http.Server{
-		Handler:   mux,
-		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+		Handler: authorizeKubeletClient(mux),
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			ClientCAs:    caPool,
+		},
 	}
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
@@ -59,8 +68,32 @@ func (a *agent) startKubeletServer(ctx context.Context, port int) error {
 			log.Printf("kubelet server: %v", err)
 		}
 	}()
-	log.Printf("kubelet server (logs) listening on https://127.0.0.1:%d", port)
+	log.Printf("kubelet server listening on https://127.0.0.1:%d (client-cert authn)", port)
 	return nil
+}
+
+// authorizeKubeletClient is the authz half: the TLS layer has verified the
+// client cert chains to our CA; only the apiserver's kubelet-client
+// identity (or a superuser cert) may use the kubelet API.
+func authorizeKubeletClient(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+			http.Error(w, "client certificate required", http.StatusUnauthorized)
+			return
+		}
+		peer := r.TLS.PeerCertificates[0]
+		authorized := peer.Subject.CommonName == "kube-apiserver-kubelet-client"
+		for _, org := range peer.Subject.Organization {
+			if org == "system:masters" {
+				authorized = true
+			}
+		}
+		if !authorized {
+			http.Error(w, fmt.Sprintf("subject %q is not authorized to use the kubelet API", peer.Subject.CommonName), http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // GET /containerLogs/{namespace}/{pod}/{container}?follow=true&tailLines=N
@@ -169,24 +202,3 @@ func seekToLastLines(f *os.File, n int) error {
 	return err
 }
 
-func selfSignedCert(nodeName string) (tls.Certificate, error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	tmpl := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: nodeName},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
-		DNSNames:     []string{nodeName},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}, nil
-}

@@ -99,11 +99,15 @@ Prereqs: Xcode CLT, Homebrew (`rustup`, `llvm`, `lld`, `xz`), Go.
    `cd pki && go build -o pki . && ./pki --dir ../etc/kubernetes`
    Adjust the absolute hostPath paths in `etc/kubernetes/manifests/*.yaml`
    for your checkout (PoC limitation).
-8. `cd agent && go build -o agent . && ./agent`
+8. Agent RBAC (once, after the control plane first answers):
+   `kubectl --kubeconfig etc/kubernetes/admin.kubeconfig apply -f etc/kubernetes/rbac.yaml`
+   (the agent runs degraded but safe until this lands: node-scoped work
+   proceeds, service resolution gets 403s).
+9. `cd agent && go build -o agent . && ./agent`
    The agent boots the control plane from `etc/kubernetes/manifests/`
    (official registry.k8s.io arm64 images, pulled on first boot) and joins
    it. No envtest, no darwin control-plane binaries.
-9. In another shell:
+10. In another shell:
    `export KUBECONFIG=$PWD/etc/kubernetes/admin.kubeconfig; kubectl get nodes; kubectl apply -f demo/pod.yaml`
 
 Standalone harness smoke test (no Kubernetes):
@@ -188,8 +192,16 @@ Standalone harness smoke test (no Kubernetes):
   `kubectl exec` (including `-it` with pty + resize + exit codes), and
   `kubectl attach` (so `kubectl run -it --image=debian:latest -- bash`
   gives an interactive root shell in a microVM) all work, served on :10250
-  using kubelet's own streaming library. Still missing: authn/authz on the
-  endpoint (delegated TokenReview/SubjectAccessReview), `port-forward`,
+  using kubelet's own streaming library, with mutual TLS from the
+  declarative PKI: the server presents `pki/kubelet-server.crt` (verified by
+  the apiserver via `--kubelet-certificate-authority`) and requires a
+  CA-signed client certificate, accepting only the apiserver's
+  kubelet-client identity — anonymous connections die at the TLS layer.
+  The agent itself runs as `system:node:macos-poc` (no system:masters):
+  the Node authorizer plus NodeRestriction admission scope its kubelet
+  work, and its data-plane resolver powers are an explicit ClusterRole in
+  `etc/kubernetes/rbac.yaml`. Still missing: delegated
+  TokenReview/SubjectAccessReview (full kubelet authz), `port-forward`,
   and multi-attach (one attach session at a time).
 - **Probes and lifecycle are real**: startup/readiness/liveness probes with
   thresholds/periods/initialDelay; exec probes run via the exec channel,

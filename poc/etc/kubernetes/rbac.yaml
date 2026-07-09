@@ -1,0 +1,40 @@
+# The node agent's powers beyond the kubelet contract, stated explicitly.
+# The Node authorizer covers everything kubelet-shaped (its own Node and
+# Lease, pods bound to it, their statuses, mirror pods). What remains is
+# the node's data-plane resolver — the role kube-proxy + a DNS plugin play
+# in a standard cluster:
+#
+#   - services read: VIP -> ClusterIP resolution and cluster DNS answers
+#   - endpoints/pods read: picking backends for a ClusterIP
+#   - services create/delete: claiming a static pod's bootstrap ClusterIP
+#     as a real Service (mirror-Service, research/static-pod-control-plane.md)
+#
+# Applied once with admin credentials at cluster bootstrap:
+#   kubectl --kubeconfig admin.kubeconfig apply -f rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-on-macos:node-resolver
+rules:
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, create, delete]
+  - apiGroups: [""]
+    resources: [endpoints, pods]
+    verbs: [get, list]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-on-macos:node-resolver
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-on-macos:node-resolver
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: system:node:macos-poc

@@ -36,7 +36,9 @@ spec:
         - --authorization-mode=Node,RBAC
         - --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt
         - --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key
+        - --kubelet-certificate-authority=/etc/kubernetes/pki/ca.crt
         - --kubelet-preferred-address-types=InternalIP
+        - --enable-admission-plugins=NodeRestriction
         - --secure-port=6443
       ports:
         - containerPort: 6443
