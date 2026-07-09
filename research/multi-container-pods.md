@@ -85,4 +85,6 @@ seconds deep — starving the lazy service-LB resolution path (guest-side 5s
 deadline) and breaking ClusterIP traffic cluster-wide. Fixed twice over:
 status pushes dedupe on a digest, and the agent now runs at kubelet-grade
 QPS (50/100). The lesson generalizes: anything on the pod data path must not
-compete with a chatty control loop for the same client.
+compete with a chatty control loop for the same client. Expanded — with the
+upstream history and the pod-launch-throughput arithmetic — in
+[client-side-rate-limiting.md](client-side-rate-limiting.md).
