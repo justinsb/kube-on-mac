@@ -103,10 +103,21 @@ func setupServiceLB(cidr string) error {
 	// packet only needs to survive the routing decision to hit our OUTPUT
 	// hook; after DNAT it re-routes to the real (on-link /64) pod address.
 	if link, err := netlink.LinkByName("eth1"); err == nil {
-		if err := netlink.RouteAdd(&netlink.Route{
+		route := &netlink.Route{
 			LinkIndex: link.Attrs().Index,
 			Dst:       ipnet,
-		}); err != nil && !os.IsExist(err) {
+		}
+		// Pin the preferred source to the pod address: source selection must
+		// never fall back to ::1 (see configureNet6's NODAD note).
+		if addrs, err := netlink.AddrList(link, netlink.FAMILY_V6); err == nil {
+			for _, a := range addrs {
+				if a.IP.IsGlobalUnicast() {
+					route.Src = a.IP
+					break
+				}
+			}
+		}
+		if err := netlink.RouteAdd(route); err != nil && !os.IsExist(err) {
 			log.Printf("adding service CIDR route: %v (continuing; RA may cover it)", err)
 		}
 	}

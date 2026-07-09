@@ -244,11 +244,7 @@ Standalone harness smoke test (no Kubernetes):
   — the ServiceAccount token volume that admission injects into every pod is
   skipped, everything else unsupported fails the mount (pod stays Pending in
   FailedMount with backoff).
-- **Single container per pod.** Known data-plane caveat: an as-yet-undiagnosed
-  guest→host vsock dial hang was observed in the kube-apiserver pod
-  specifically (see research/static-pod-control-plane.md, "Findings from the
-  flip"); execd now bounds those dials at 3s so the LB cannot wedge, and the
-  bootstrap-critical apiserver→etcd hop avoids the VIP path entirely.
+- **Single container per pod.**
 
 ## Measured
 

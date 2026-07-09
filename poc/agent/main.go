@@ -730,6 +730,9 @@ func (a *agent) runPod(ctx context.Context, pod *corev1.Pod, vm *podVM) {
 		cmd := exec.Command(a.harness, harnessArgs...)
 		cmd.Stdout = logf
 		cmd.Stderr = logf
+		if lvl := pod.Annotations["kube-on-macos.io/vmm-log-level"]; lvl != "" {
+			cmd.Env = append(os.Environ(), "PODVM_LOG_LEVEL="+lvl)
+		}
 		if err := cmd.Start(); err != nil {
 			logf.Close()
 			if gvp != nil {

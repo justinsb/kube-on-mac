@@ -145,8 +145,14 @@ int main(int argc, char *const argv[])
             return 1;
         }
     }
-    if (check(krun_init_log(log_fd, KRUN_LOG_LEVEL_WARN, KRUN_LOG_STYLE_AUTO,
-                            0),
+    /* PODVM_LOG_LEVEL=debug turns on libkrun debug logging (per-pod via the
+     * kube-on-macos.io/vmm-log-level annotation) — used to chase device-level
+     * bugs like the vsock connect hang. */
+    uint32_t log_level = KRUN_LOG_LEVEL_WARN;
+    const char *level_env = getenv("PODVM_LOG_LEVEL");
+    if (level_env != NULL && strcmp(level_env, "debug") == 0)
+        log_level = KRUN_LOG_LEVEL_DEBUG;
+    if (check(krun_init_log(log_fd, log_level, KRUN_LOG_STYLE_AUTO, 0),
               "krun_init_log"))
         return 1;
 

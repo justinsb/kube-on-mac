@@ -21,7 +21,7 @@ spec:
       image: registry.k8s.io/kube-apiserver:v1.33.0
       command:
         - kube-apiserver
-        - --etcd-servers=https://192.168.127.254:2379
+        - --etcd-servers=https://[fd42:6b75:6265:1::2]:2379
         - --etcd-cafile=/etc/kubernetes/pki/ca.crt
         - --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt
         - --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key

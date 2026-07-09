@@ -223,16 +223,29 @@ each is a lesson about the boundaries between the pieces:
   life. The LB setup is now synchronous, before the workload starts.
   (This was invisible for a year of pods that didn't dial VIPs in their
   first second.)
-- **Guest→host vsock dials can hang indefinitely** — observed persistently
-  in the kube-apiserver pod, not reproducible in identical test pods;
-  correlations with memory size and hostPorts both died under bisection.
-  OPEN INVESTIGATION (likely libkrun). Mitigations shipped: execd bounds
-  svc-channel dials at 3s (a wedged dial used to freeze the whole LB queue
-  behind a mutex), and the bootstrap-critical apiserver→etcd hop now uses
-  the node loopback path instead of the VIP: etcd publishes hostPort 2379
-  and the apiserver dials gvproxy's host gateway (192.168.127.254, added to
-  etcd's cert SANs) — the moral equivalent of real control planes using
-  localhost etcd, with no data-plane dependency.
+- **RESOLVED — the "vsock mystery" was IPv6 Duplicate Address Detection.**
+  The pod's ULA is *tentative* for its first ~1–2s, and a tentative address
+  may not be used as a source — so the kernel picked **::1** for boot-time
+  outbound flows (caught by in-guest tcpdump: the DNAT'd SYN to etcd left
+  as `::1 → etcd:2379`; the reply went to etcd's own loopback). A TCP
+  socket pins its source at connect, so retransmits keep ::1 and the flow
+  is dead for its whole life. Scriptable clients recover on their next
+  socket; the apiserver's gRPC makes ONE 20s connect attempt at t≈0.5s,
+  hits the storage-factory deadline, crash-loops, and lands back inside
+  the window — every time. All earlier correlations (memory size,
+  hostPorts, vCPUs, the vsock channel itself) were restart-timing
+  coincidences; the true variable was "first flow in the first two
+  seconds". Fix: the ULA is added with **IFA_F_NODAD** (it is derived from
+  the pod UID on a private bridge — duplicate detection buys nothing) and
+  the service-CIDR route pins `src` to the pod address. Verified: dial 0
+  at t=0.02s with the correct source, and the apiserver assembles over the
+  etcd VIP with zero crash-loops — the manifest uses the VIP path again
+  (etcd keeps hostPort 2379 as a host-side etcdctl convenience). The 3s
+  bound on execd's vsock dials stays as hygiene: a wedged dial must never
+  freeze the LB queue behind its mutex. Debugging aid that made this
+  findable, kept: `kube-on-macos.io/vmm-log-level: debug` annotation
+  (libkrun debug logging per pod), and the in-guest tcpdump-to-virtiofs
+  trick (the pcap lands in the pod's host-visible rootfs).
 - **RBAC is real now, and it said no.** KCM as a single user may not create
   ReplicaSets; the bootstrap bindings target per-controller ServiceAccounts,
   activated by `--use-service-account-credentials=true` (why kubeadm sets

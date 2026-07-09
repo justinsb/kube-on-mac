@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata: { name: zz-vsock-repro, namespace: kube-system }
+spec:
+  containers:
+    - name: repro
+      image: alpine:3.22
+      command:
+        - /bin/sh
+        - -c
+        - |
+          # Phase 1: immediate-at-boot sequential lookups (mimics apiserver's t~0.5s dial)
+          for i in $(seq 1 10); do
+            nslookup -timeout=4 "p1-$i.default.svc.cluster.local" 127.0.0.1 >/dev/null 2>&1 && echo "p1-$i OK" || echo "p1-$i FAIL"
+          done
+          # Phase 2: parallel lookups under CPU load (mimics 3 grpc subchannels + busy apiserver init)
+          yes >/dev/null & YPID=$!
+          for i in $(seq 1 10); do
+            ( nslookup -timeout=4 "p2-$i.default.svc.cluster.local" 127.0.0.1 >/dev/null 2>&1 && echo "p2-$i OK" || echo "p2-$i FAIL" ) &
+          done
+          wait $(jobs -p | grep -v $YPID) 2>/dev/null
+          kill $YPID
+          echo REPRO-DONE
+          sleep 600
+      resources:
+        limits: { cpu: "1", memory: 512Mi }

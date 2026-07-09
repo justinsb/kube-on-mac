@@ -40,6 +40,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/mdlayher/vsock"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -131,6 +132,12 @@ func configureNet6(ns *net6Spec) error {
 	if err != nil {
 		return fmt.Errorf("parsing ip %q: %w", ns.IP, err)
 	}
+	// NODAD: a tentative (DAD-in-progress) address may not be used as a
+	// source, so for the pod's first ~2s the kernel picked ::1 for outbound
+	// flows — poisoning any TCP connection made at boot for its entire
+	// life (retransmits keep the source). The ULA is derived from the pod
+	// UID on a private bridge; duplicate detection buys nothing.
+	addr.Flags = unix.IFA_F_NODAD
 	if err := netlink.AddrAdd(eth1, addr); err != nil {
 		return fmt.Errorf("adding address: %w", err)
 	}
