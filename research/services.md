@@ -100,10 +100,17 @@ kernel so packets flow in-kernel, no persistent per-VIP rule." Findings:
 
 ## Control plane (host agent)
 
-- No kube-controller-manager runs in the PoC, so nothing writes
+- ~~No kube-controller-manager runs in the PoC, so nothing writes
   EndpointSlices. The agent answers endpoint queries directly: Services
   watched for ClusterIP+selector; endpoints = Running+Ready pods matching
-  the selector, using their podIPs (our routed IPv6 ULAs).
+  the selector, using their podIPs (our routed IPv6 ULAs).~~ Superseded:
+  KCM runs now and writes real EndpointSlices, and the resolver consumes
+  them from watch-based informer caches (kube-proxy's diet: Services +
+  EndpointSlices) — zero API requests at query time, and named targetPorts
+  work for free since slices carry resolved port numbers. The readiness we
+  report on pods flows through the endpointslice controller back into our
+  own data plane. Why the cache matters:
+  [client-side-rate-limiting.md](client-side-rate-limiting.md).
 - ClusterIPs must be IPv6: apiserver runs with
   `--service-cluster-ip-range=<v6 prefix>` (single-stack IPv6 services).
   The apiserver allocates ClusterIPs itself — no controller needed.

@@ -42,7 +42,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	corev1listers "k8s.io/client-go/listers/core/v1"
+	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -178,6 +181,14 @@ type agent struct {
 	clientCA    string
 	imageBlock  bool
 
+	// Watch-based caches for the service resolver (kube-proxy's diet):
+	// resolving a ClusterIP costs zero API requests at query time, so the
+	// latency-sensitive data path can't queue behind control-loop traffic
+	// (research/client-side-rate-limiting.md).
+	svcLister    corev1listers.ServiceLister
+	epsLister    discoverylisters.EndpointSliceLister
+	cachesSynced atomic.Bool
+
 	mu         sync.Mutex
 	vms        map[types.UID]*podVM
 	staticVIPs map[string]*podVM // bootstrap ClusterIPs (static pod annotation) -> backend
@@ -312,6 +323,24 @@ func main() {
 	}
 	a.client.Store(client)
 	log.Printf("apiserver is up (%s)", cfg.Host)
+
+	// One watch each on Services and EndpointSlices replaces the resolver's
+	// per-query LISTs. The resolver answers from these caches only after
+	// initial sync (bootstrap VIPs don't wait on this — they resolve from
+	// the agent's own table).
+	factory := informers.NewSharedInformerFactory(client, 10*time.Minute)
+	a.svcLister = factory.Core().V1().Services().Lister()
+	a.epsLister = factory.Discovery().V1().EndpointSlices().Lister()
+	factory.Start(ctx.Done())
+	go func() {
+		for _, ok := range factory.WaitForCacheSync(ctx.Done()) {
+			if !ok {
+				return
+			}
+		}
+		a.cachesSynced.Store(true)
+		log.Printf("service/endpointslice watch caches synced")
+	}()
 
 	for {
 		if err := a.registerNode(ctx); err == nil {

@@ -92,10 +92,12 @@ defaults** — and keeps client-side limiting on rather than going to `-1`:
 matching the real kubelet's shipped configuration is the point of this
 project, tuning rationale included. Independently, status pushes dedupe on a
 digest, so the steady-state request rate is tiny (fix #1 above did the real
-work; the QPS bump is headroom). If the lazy service-LB resolver ever
-contends again, the right move is fix #1's stronger form — a watch-based
-local cache of Services/EndpointSlices instead of per-query LISTs — not more
-QPS.
+work; the QPS bump is headroom). And the lazy service-LB resolver now
+applies fix #1's stronger form: it answers from watch-based informer caches
+of Services + EndpointSlices (kube-proxy's diet) — zero API requests at
+query time, so the latency-sensitive path can't queue behind anything, at
+any QPS setting. As a bonus, EndpointSlices carry resolved port numbers, so
+named targetPorts went from "not supported" to free.
 
 ## Postmortem: how it bit us (2026-07-09)
 
