@@ -49,6 +49,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -484,25 +485,62 @@ func (a *agent) renewNodeLease(ctx context.Context) {
 	}
 }
 
+// reconcileLoop watches pods bound to this node, kubelet-style. Watch, not
+// poll: detection latency was the biggest chunk of single-pod launch time
+// (research/pod-launch-benchmarks.md). The 30s resync is the safety net
+// that replaces the old 1s list-poll.
 func (a *agent) reconcileLoop(ctx context.Context) {
-	tick := time.NewTicker(1 * time.Second)
-	defer tick.Stop()
-	for {
-		select {
-		case <-ctx.Done():
+	factory := informers.NewSharedInformerFactoryWithOptions(a.cs(), 30*time.Second,
+		informers.WithTweakListOptions(func(o *metav1.ListOptions) {
+			o.FieldSelector = "spec.nodeName=" + a.nodeName
+		}))
+	informer := factory.Core().V1().Pods().Informer()
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			if pod, ok := obj.(*corev1.Pod); ok {
+				a.reconcilePod(ctx, pod)
+			}
+		},
+		UpdateFunc: func(_, obj any) {
+			if pod, ok := obj.(*corev1.Pod); ok {
+				a.reconcilePod(ctx, pod)
+			}
+		},
+		DeleteFunc: a.podDeleted,
+	})
+	factory.Start(ctx.Done())
+	<-ctx.Done()
+}
+
+// podDeleted stops the VM of a pod whose API object is gone — the poll
+// never noticed this (a force-deleted pod simply stopped appearing, leaking
+// its VM); the watch makes it explicit.
+func (a *agent) podDeleted(obj any) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		tomb, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
 			return
-		case <-tick.C:
-			pods, err := a.cs().CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
-				FieldSelector: "spec.nodeName=" + a.nodeName,
-			})
-			if err != nil {
-				continue
-			}
-			for i := range pods.Items {
-				a.reconcilePod(ctx, &pods.Items[i])
-			}
+		}
+		if pod, ok = tomb.Obj.(*corev1.Pod); !ok {
+			return
 		}
 	}
+	// A deleted mirror pod doesn't stop its static pod: the manifest is the
+	// source of truth, and the static pod manager recreates the mirror.
+	if pod.Annotations[mirrorAnnotation] != "" {
+		return
+	}
+	a.mu.Lock()
+	vm := a.vms[pod.UID]
+	a.mu.Unlock()
+	if vm == nil {
+		return
+	}
+	vm.stopOnce.Do(func() {
+		vm.setStopping()
+		go a.killVM(vm, podGracePeriod(pod), "pod object deleted")
+	})
 }
 
 func (a *agent) reconcilePod(ctx context.Context, pod *corev1.Pod) {

@@ -16,11 +16,29 @@ kubelet-style status pipeline.
 
 ## Results
 
+With the agent's original 1s list-poll for pod detection:
+
 | N | apply | all Ready | throughput | per-pod p50 | p90 | max |
 |---|---|---|---|---|---|---|
 | 1 (×5 runs) | ~0.1s | **0.6–1.1s** | — | ~1s | — | — |
 | 10 | 0.2s | **1.9–2.3s** | ~5 pods/s | 1–2s | 2s | 2s |
 | 100 | 1.7s | **10.1s** | **~10 pods/s** | 5s | 7s | 8s |
+
+After switching detection to a watch (filtered pod informer, kubelet-style):
+
+| N | apply | all Ready | throughput | per-pod p50 | p90 | max |
+|---|---|---|---|---|---|---|
+| 1 (×5 runs) | ~0.1s | **0.5–0.6s** | — | 0–1s | — | — |
+| 10 | 0.4s | **1.8s** | ~5.5 pods/s | 2s | 2s | 2s |
+| 100 | 1.9s | **9.4s** | **~10.7 pods/s** | 4s | 7s | 7s |
+
+The watch removed the poll's 0–1s detection jitter: single-pod launch is
+now a tight 0.5–0.6s, and *deletion* detection became instant as well
+(bench cleanup detection dropped from ~1.1s to ~0s; a force-deleted pod's
+VM dies within a second — the poll could leak such VMs forever, since a
+vanished object simply stopped appearing in the list). At N=100 the gain
+is modest, confirming the bottleneck there is spawn/boot contention, not
+detection.
 
 - **Teardown**: 100 pods deleted (graceful, SIGTERM in-guest) in ~4.3s.
 - **Footprint**: ~54MB host RSS per idle pod (podvm + gvproxy +
@@ -31,13 +49,12 @@ kubelet-style status pipeline.
 
 ## Where the single-pod second goes
 
-Roughly: scheduler bind is ~instant; the agent's reconcile loop is a 1s
-list-poll, so detection alone contributes up to ~1s (a pod *watch* would
-shave most of that — it's the obvious next optimization and what a real
-kubelet does); rootfs staging is milliseconds (the boot dir is execd + a
+Roughly (post-watch): scheduler bind and agent detection are ~instant
+(watch events); rootfs staging is milliseconds (the boot dir is execd + a
 JSON spec; the image is a shared read-only block device, nothing is
 copied); microVM boot to execd-running is a few hundred ms; the first
-status push happens immediately at start.
+status push happens immediately at start. The remaining ~half second is
+almost entirely VM boot plus the first status round-trip.
 
 At N=100 the median rises to 5s: 100 `runPod` goroutines contend for 12
 cores of process spawning (3 host processes per pod) and VM boots. Still,
