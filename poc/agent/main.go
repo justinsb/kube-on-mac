@@ -404,12 +404,12 @@ func (a *agent) nodeStatus() corev1.NodeStatus {
 		Capacity: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("8"),
 			corev1.ResourceMemory: resource.MustParse("16Gi"),
-			corev1.ResourcePods:   resource.MustParse("32"),
+			corev1.ResourcePods:   resource.MustParse("250"),
 		},
 		Allocatable: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("8"),
 			corev1.ResourceMemory: resource.MustParse("12Gi"),
-			corev1.ResourcePods:   resource.MustParse("32"),
+			corev1.ResourcePods:   resource.MustParse("250"),
 		},
 		Conditions: []corev1.NodeCondition{{
 			Type:               corev1.NodeReady,
