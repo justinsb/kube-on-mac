@@ -33,7 +33,7 @@ hello-macos   1/1     Running   0          4s
   window via `--dax-mb`), libkrun's built-in init execs the workload,
   stdout/stderr stream to the harness's stdio. Signed ad-hoc with the
   `com.apple.security.hypervisor` entitlement.
-- `agent/` — the PoC node agent (Go), a kubelet stand-in. Boots the static
+- `agent/` — the PoC node agent (Go), a kubelet replacement. Boots the static
   pods in `etc/kubernetes/manifests/` — which ARE the control plane: etcd,
   kube-apiserver, kube-controller-manager, kube-scheduler, official
   registry.k8s.io arm64 images, each in its own microVM — then joins the

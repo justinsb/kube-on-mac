@@ -415,8 +415,9 @@ $ kubectl delete deployment redis-follower      # real GC cascade: deployment �
 
 Rolling updates, `kubectl rollout undo`, EndpointSlices, namespace deletion,
 real cascade GC — all free. The agent is back to being purely a kubelet
-stand-in, which is the thesis of the project anyway. (Possible follow-up: the
+replacement, which is the thesis of the project anyway. (Possible follow-up: the
 agent's service resolver still computes endpoints from selectors; it could
 consume the now-real EndpointSlices instead. And kube-scheduler could replace
-the bind loop the same way.)
+the bind loop the same way. — Both since done: the real kube-scheduler binds
+pods, and the resolver consumes EndpointSlices from a watch cache.)
 

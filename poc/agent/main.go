@@ -1,6 +1,6 @@
 // PoC node agent for kube-on-macos.
 //
-// A kubelet stand-in for macOS: the control plane itself (etcd,
+// A kubelet replacement for macOS: the control plane itself (etcd,
 // kube-apiserver, kube-controller-manager, kube-scheduler — official
 // images) runs as static pods from etc/kubernetes/manifests, each in its
 // own Linux microVM; the agent boots those before any apiserver exists,
