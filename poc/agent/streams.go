@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	remotecommandconsts "k8s.io/apimachinery/pkg/util/remotecommand"
 	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/kubelet/pkg/cri/streaming/portforward"
 	remotecommandserver "k8s.io/kubelet/pkg/cri/streaming/remotecommand"
 	utilexec "k8s.io/utils/exec"
 )
@@ -233,6 +234,42 @@ func (a *agent) ExecInContainer(ctx context.Context, name string, uid types.UID,
 	cmd []string, in io.Reader, out, errw io.WriteCloser, tty bool,
 	resize <-chan remotecommand.TerminalSize, timeout time.Duration) error {
 	return a.session(ctx, uid, map[string]any{"op": "exec", "container": container, "argv": cmd, "tty": tty}, in, out, errw, resize)
+}
+
+// PortForward implements the kubelet streaming PortForwarder interface: one
+// forwarded connection = one execd session bridging the client stream to a
+// loopback dial inside the pod VM.
+func (a *agent) PortForward(ctx context.Context, name string, uid types.UID, port int32, stream io.ReadWriteCloser) error {
+	return a.session(ctx, uid, map[string]any{"op": "portforward", "port": int(port)}, stream, stream, nil, nil)
+}
+
+// POST /portForward/{namespace}/{pod} (a trailing {uid} is accepted and
+// ignored: we resolve the pod's state UID ourselves so restarted static
+// pods keep working).
+func (a *agent) handlePortForward(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/portForward/"), "/"), "/")
+	if len(parts) != 2 && len(parts) != 3 {
+		http.Error(w, "expected /portForward/{namespace}/{pod}", http.StatusNotFound)
+		return
+	}
+	ns, podName := parts[0], parts[1]
+	client := a.cs()
+	if client == nil {
+		http.Error(w, "apiserver not available yet", http.StatusServiceUnavailable)
+		return
+	}
+	pod, err := client.CoreV1().Pods(ns).Get(r.Context(), podName, metav1.GetOptions{})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	opts, err := portforward.NewV4Options(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	portforward.ServePortForward(w, r, a, podName, podStateUID(pod), opts,
+		time.Hour, 30*time.Second, portforward.SupportedProtocols)
 }
 
 // AttachContainer implements the kubelet streaming Attacher interface.

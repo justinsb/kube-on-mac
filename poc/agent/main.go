@@ -9,15 +9,18 @@
 // scheduled pods into further microVMs (libkrun on Hypervisor.framework).
 // Pod phase/status is reported back honestly.
 //
-// Implemented so far: real image pulls (flattened, cached), kubectl
-// logs/exec/attach via the :10250 kubelet server, startup/readiness/liveness
-// probes (exec + in-guest http/tcp via execd), graceful termination
-// (SIGTERM in the guest, SIGKILL after grace), restartPolicy with naive
-// crash backoff, hostPath/emptyDir/configMap/secret volumes (per-volume
-// virtio-fs shares; configMap/secret materialized at pod start), static
-// pods from a manifest dir (running before/without the apiserver) with
-// mirror pods. Still missing: port-forward, projected volumes,
-// authn/authz on the kubelet server.
+// Implemented so far: real image pulls (EROFS block images, cached, shared
+// per image), multi-container pods (one VM per pod, execd supervises
+// containers in-guest), kubectl logs/exec/attach/port-forward via the
+// :10250 kubelet server (mTLS), startup/readiness/liveness probes (exec +
+// in-guest http/tcp via execd) restarting only the probed container,
+// graceful termination (SIGTERM in the guest, SIGKILL after grace),
+// restartPolicy with crash backoff, hostPath/emptyDir/configMap/secret
+// volumes (per-volume virtio-fs shares; configMap/secret materialized at
+// pod start), static pods from a manifest dir (running before/without the
+// apiserver) with mirror pods, watch-cache service resolution
+// (Services + EndpointSlices). Still missing: projected volumes
+// (ServiceAccount tokens), subPath, env valueFrom.
 package main
 
 import (

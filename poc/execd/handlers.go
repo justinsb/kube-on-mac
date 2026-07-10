@@ -57,9 +57,54 @@ func handleConn(fc *framedConn, sup *supervisor) {
 		handleStatus(fc, sup)
 	case "kill":
 		handleKill(fc, req, sup)
+	case "portforward":
+		handlePortForward(fc, req)
 	case "shutdown":
 		handleShutdown(fc, req, sup)
 	}
+}
+
+// handlePortForward bridges one forwarded connection to a port inside the
+// pod, dialed on loopback — the kubelet dials inside the pod's netns, so
+// apps bound only to 127.0.0.1 are reachable, matching real port-forward
+// semantics (and unlike going via the pod IP).
+func handlePortForward(fc *framedConn, req request) {
+	if req.Port == 0 {
+		fc.writeFrame(frameExit, []byte(`{"code":126,"error":"no port"}`))
+		return
+	}
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", req.Port), 5*time.Second)
+	if err != nil {
+		fc.writeFrame(frameExit, []byte(fmt.Sprintf(`{"code":1,"error":%q}`, err.Error())))
+		return
+	}
+	defer conn.Close()
+	done := make(chan struct{})
+	go func() {
+		io.Copy(&frameWriter{fc, frameStdout}, conn)
+		close(done)
+	}()
+	go func() {
+		for {
+			typ, payload, err := fc.readFrame()
+			if err != nil {
+				conn.Close() // client went away; unblock the copy above
+				return
+			}
+			switch typ {
+			case frameStdin:
+				if _, err := conn.Write(payload); err != nil {
+					return
+				}
+			case frameStdinClose:
+				if tc, ok := conn.(*net.TCPConn); ok {
+					tc.CloseWrite()
+				}
+			}
+		}
+	}()
+	<-done
+	fc.writeFrame(frameExit, []byte(`{"code":0}`))
 }
 
 // handleKill restarts one container: SIGTERM (SIGKILL after grace); its

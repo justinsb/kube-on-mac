@@ -21,7 +21,7 @@ import (
 )
 
 // startKubeletServer serves the slice of the kubelet API the apiserver
-// proxies to (/containerLogs, /exec, /attach). TLS both ways, from the
+// proxies to (/containerLogs, /exec, /attach, /portForward). TLS both ways, from the
 // declarative PKI: it serves pki/kubelet-server.crt (which the apiserver
 // verifies via --kubelet-certificate-authority), and it requires a
 // CA-signed client certificate, accepting only the apiserver's kubelet
@@ -46,6 +46,7 @@ func (a *agent) startKubeletServer(ctx context.Context, port int) error {
 	mux.HandleFunc("/containerLogs/", a.handleContainerLogs)
 	mux.HandleFunc("/exec/", a.handleExec)
 	mux.HandleFunc("/attach/", a.handleAttach)
+	mux.HandleFunc("/portForward/", a.handlePortForward)
 
 	srv := &http.Server{
 		Handler: authorizeKubeletClient(mux),
